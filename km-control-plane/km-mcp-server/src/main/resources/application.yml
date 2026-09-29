@@ -1,0 +1,52 @@
+server:
+  # 8081 —— MCP 网关。Python Agent 连的就是这个端口。
+  port: 8081
+
+spring:
+  application:
+    name: km-mcp-server
+
+  ai:
+    mcp:
+      server:
+        name: km-mcp-server
+        version: 0.1.0
+
+        # ★★★ 整个项目最容易踩的坑, 改之前先读完这段 ★★★
+        #
+        # Spring AI 2.0.1 底层依赖 io.modelcontextprotocol.sdk:mcp:2.0.0,
+        # 这个版本实现的是 MCP 2026-07-28 修订版 —— 一个【无状态】协议:
+        #   - 没有 initialize 握手
+        #   - 没有 Mcp-Session-Id
+        #   - 协议版本等元数据挂在每个请求的 _meta 里
+        #
+        # 但 Python 侧 langchain-mcp-adapters 0.3.2 要求 mcp<2.0.0,
+        # 也就是还在用【带握手的旧版协议】。
+        #
+        # 所以这里必须用 STREAMABLE(带会话的流式 HTTP, 对应 MCP 2025-11-25 一线),
+        # 绝对不要改成 STATELESS —— 那样 Python 客户端连不上。
+        #
+        # 三个可选值: sse (已废弃的两段式) / streamable / stateless
+        protocol: streamable
+
+        # sync  = 基于 Spring MVC 的同步模型(本项目)
+        # async = 基于 WebFlux, 工具方法要返回 Mono/Flux
+        type: sync
+
+        streamable-http:
+          mcp-endpoint: /mcp
+
+        # 开发期把请求超时调大, 方便单步调试
+        request-timeout: 60s
+
+# 存量微服务地址。将来接真实业务系统时只改这一行。
+km:
+  backend:
+    order-service:
+      base-url: http://localhost:8082
+
+logging:
+  level:
+    com.km.mcp: DEBUG
+    # 打开 MCP 协议层的日志, 排查握手问题时非常有用
+    io.modelcontextprotocol: DEBUG

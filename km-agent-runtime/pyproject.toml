@@ -1,0 +1,72 @@
+[project]
+name = "km-agent-runtime"
+version = "0.1.0"
+description = "K_middleware Python Agent 运行时 — LangGraph 编排 + MCP Client + 分层记忆"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # ---- Web 层 ----
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.38.0",
+
+    # ---- Agent 编排 ----
+    "langgraph>=1.2.11",
+    "langchain-core>=1.4.7",
+    "langchain-openai>=1.6.2",
+
+    # ---- MCP 客户端 ----
+    # ★★★ 本文件最关键的一行, 改之前读完 ★★★
+    #
+    # langchain-mcp-adapters 0.3.2 的依赖声明是 `mcp<2.0.0,>=1.24.0`,
+    # 也就是它【不支持 mcp 2.x】。
+    #
+    # 而 mcp 的版本分线正好对应两代协议:
+    #     mcp 1.x  -> 带 initialize 握手的旧版协议 (当前 1.30.0, 仍在维护)
+    #     mcp 2.x  -> MCP 2026-07-28 的【无状态】协议 (2026-07-28 发布)
+    #
+    # Java 侧 Spring AI 2.0.1 用的 io.modelcontextprotocol.sdk:mcp:2.0.0 是 2.x 线。
+    # 两边能不能对上, 取决于 Java 服务端是否向后兼容旧版握手。
+    # 这就是 tests/test_mcp_handshake.py 要验证的东西 ——
+    # 在跑通那个测试之前, 不要在这个项目上写任何业务代码。
+    #
+    # 显式钉住 <2.0.0 是为了防止哪天 langchain-mcp-adapters 放宽约束后,
+    # 解析器悄悄把 mcp 升到 2.x 而协议对不上。
+    "langchain-mcp-adapters>=0.3.2",
+    "mcp>=1.30.0,<2.0.0",
+
+    # ---- 配置 ----
+    "pydantic-settings>=2.7.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.28.0",
+
+    # ---- 持久化 (语义记忆 + LangGraph checkpoint) ----
+    "langgraph-checkpoint-postgres>=3.1.2",
+    "psycopg[binary,pool]>=3.2.0",
+]
+
+[project.optional-dependencies]
+# Phase3 才用得上, 现在装着只会拖慢初始化
+ml = [
+    "sentence-transformers>=3.3.0",
+    "pgvector>=0.3.6",
+]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"

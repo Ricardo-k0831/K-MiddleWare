@@ -1,0 +1,117 @@
+# ============================================================
+#  K_middleware 本地开发环境
+#
+#  一键拉起:  docker compose -f docker/docker-compose.yml up -d
+#  看状态:    docker compose -f docker/docker-compose.yml ps
+#  全清:      docker compose -f docker/docker-compose.yml down -v
+#
+#  注意: Java / Python 应用本身跑在宿主机, 不进容器。
+#  这样 IDE 断点调试最简单, 也避免跨语言的镜像构建拖慢迭代。
+# ============================================================
+name: km-middleware
+
+services:
+  # ---------- MySQL: 任务元信息 + MCP 工具注册中心 + 审计日志 ----------
+  # 定位: Java 侧是全局状态唯一事实源(single source of truth)
+  mysql:
+    image: mysql:8.4
+    container_name: km-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pwd
+      MYSQL_DATABASE: km_control
+      MYSQL_USER: km
+      MYSQL_PASSWORD: km_dev_pwd
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./init/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_pwd"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ---------- Redis: 工作记忆 + 分布式锁 + 限流计数器 ----------
+  redis:
+    image: redis:7.4-alpine
+    container_name: km-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ---------- PostgreSQL + pgvector: 语义记忆 (RAG) + LangGraph checkpoint ----------
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: km-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: km_memory
+      POSTGRES_USER: km
+      POSTGRES_PASSWORD: km_dev_pwd
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U km -d km_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ---------- RocketMQ: Agent 长任务异步解耦 ----------
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.3.1
+    container_name: km-rocketmq-namesrv
+    restart: unless-stopped
+    ports:
+      - "9876:9876"
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+    volumes:
+      - rocketmq-namesrv-logs:/home/rocketmq/logs
+    command: sh mqnamesrv
+
+  rocketmq-broker:
+    image: apache/rocketmq:5.3.1
+    container_name: km-rocketmq-broker
+    restart: unless-stopped
+    depends_on:
+      - rocketmq-namesrv
+    ports:
+      - "10909:10909"   # VIP 通道
+      - "10911:10911"   # broker 主端口
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+    volumes:
+      # 挂在固定路径, 不要写 /home/rocketmq/rocketmq-5.3.1/conf/ ——
+      # 那个路径含版本号, 镜像一升级就挂不上, 而报错信息不会告诉你是路径问题。
+      - ./init/rocketmq/broker.conf:/home/rocketmq/broker.conf:ro
+      - rocketmq-broker-store:/home/rocketmq/store
+      - rocketmq-broker-logs:/home/rocketmq/logs
+    command: sh mqbroker -n rocketmq-namesrv:9876 -c /home/rocketmq/broker.conf
+
+volumes:
+  mysql-data:
+  redis-data:
+  pg-data:
+  rocketmq-namesrv-logs:
+  rocketmq-broker-store:
+  rocketmq-broker-logs:

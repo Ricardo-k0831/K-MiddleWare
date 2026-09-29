@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.km</groupId>
+        <artifactId>km-control-plane</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>km-mcp-server</artifactId>
+    <name>km-mcp-server</name>
+    <description>
+        MCP 工具网关。把存量 Java 微服务包装成标准 MCP 工具暴露给 Python Agent。
+        后续所有企业级能力(鉴权 / 限流 / 熔断 / 审计)都收敛在这一层,
+        业务微服务不需要任何改动。
+    </description>
+
+    <dependencies>
+        <!--
+          spring-ai-starter-mcp-server-webmvc
+            = Streamable HTTP 传输 (基于 Spring MVC, 同步模型)
+          对应 artifact: spring-ai-autoconfigure-mcp-server-webmvc
+          底层依赖: io.modelcontextprotocol.sdk:mcp:2.0.0
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+        </dependency>
+
+        <!-- 调用存量微服务用。RestClient 是 Spring 6.1+ 引入的同步阻塞客户端,
+             比 RestTemplate 更现代, 也不用像 WebClient 那样为它引入响应式栈。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!--
+          ★ Spring Boot 4 的迁移坑 ★
+          Boot 4 把自动配置做了模块化拆分, spring-boot-starter-web 现在【只】包含
+          jackson / tomcat / http-converter / webmvc —— 不再包含 RestClient。
+
+          少了这个依赖, 启动时会报:
+            No qualifying bean of type 'org.springframework.web.client.RestClient$Builder'
+
+          这个 starter 提供自动配置好的 RestClient.Builder (已装配好消息转换器),
+          所以代码里可以直接注入 Builder 而不用自己 new。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-restclient</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

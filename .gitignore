@@ -1,0 +1,36 @@
+# ---- Java ----
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/wrapper/maven-wrapper.properties
+hs_err_pid*
+replay_pid*
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- Env / secrets ----
+.env
+.env.local
+*.local.yml
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+*.iws
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Docker volumes (if bind-mounted locally) ----
+docker/data/

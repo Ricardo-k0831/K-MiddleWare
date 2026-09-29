@@ -1,0 +1,11 @@
+server:
+  # 8082 —— 模拟"存量微服务"监听自己的端口, 和 MCP 网关(8081)分开
+  port: 8082
+
+spring:
+  application:
+    name: km-mock-order-service
+
+logging:
+  level:
+    com.km.mock: DEBUG
