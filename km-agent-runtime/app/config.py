@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # 走 OpenAI 兼容协议, 所以 DeepSeek / 通义千问 / OpenAI / 本地 vLLM 都能直接用,
     # 换供应商只需要改这三个环境变量。
     llm_base_url: str = "https://api.deepseek.com/v1"
+    # 这里刻意留空。真实 key 放仓库根目录的 .env (已被 .gitignore 忽略),
+    # 由 pydantic-settings 覆盖这个默认值。
+    # 不要把 key 直接写在这行 —— 这个文件是被 git 跟踪的, 一次 git add . 就会提交上去。
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.0  # Agent 场景要确定性, 不要创造力

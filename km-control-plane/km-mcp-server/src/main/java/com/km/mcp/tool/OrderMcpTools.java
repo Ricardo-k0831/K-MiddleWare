@@ -31,6 +31,28 @@ import java.util.Map;
  * 技术性堆栈, 它没法从中恢复, 只会把错误原样抛给用户。
  * 转成自然语言的错误描述后, Agent 才有机会降级处理
  * (比如换个参数重试, 或告诉用户"订单号可能写错了")。
+ *
+ * <h3>★ 返回值必须是 JSON object, 不能是数组</h3>
+ * 这条是硬约束, 违反它会以一种极难看懂的方式失败。
+ *
+ * <p>{@code generateOutputSchema = true} 时, Spring AI 把方法返回值直接
+ * 塞进 MCP 的 {@code structuredContent} 字段。而 MCP 规范规定
+ * {@code structuredContent} 必须是一个 JSON <b>object</b>。
+ * 返回 {@code List} 时, Java 侧照发不误, 但 Python 侧 mcp 1.x 客户端的
+ * {@code CallToolResult.structuredContent} 声明是 {@code dict[str, Any]},
+ * pydantic 校验直接抛:</p>
+ *
+ * <pre>
+ *   ValidationError: 1 validation error for CallToolResult
+ *   structuredContent  Input should be a valid dictionary
+ *     input_value=[{...}], input_type=list
+ * </pre>
+ *
+ * <p>注意失败点在<b>客户端解析响应时</b>, 不在调用时 —— 所以 Java 日志里
+ * 一切正常, 只有 Python 侧报错, 排查时极易怀疑错方向。</p>
+ *
+ * <p>绕法是包一层 object: {@code Map.of("count", n, "orders", list)}。
+ * 将来加"库存列表""用户列表"之类的工具时同样要包。</p>
  */
 @Component
 public class OrderMcpTools {
@@ -78,16 +100,24 @@ public class OrderMcpTools {
                     """,
             generateOutputSchema = true
     )
-    public List<Map<String, Object>> listOrdersByUser(
+    public Map<String, Object> listOrdersByUser(
             @McpToolParam(required = true, description = "用户ID, 形如 U1001")
             String userId) {
 
         log.info("[MCP] list_orders_by_user userId={}", userId);
         try {
-            return orderServiceClient.listOrdersByUser(userId);
+            List<Map<String, Object>> orders = orderServiceClient.listOrdersByUser(userId);
+            // 必须包成 object, 不能直接返回 List —— 见类注释"返回值必须是 JSON object"
+            return Map.of("count", orders.size(), "orders", orders);
         } catch (OrderServiceException ex) {
+            // 注意: 这里不能返回空列表。后端挂了和"该用户确实没有订单"是两回事,
+            // 返回空列表会让 Agent 把故障如实转述成"你没有订单", 是在骗用户。
             log.warn("[MCP] list_orders_by_user 失败 userId={}", userId, ex);
-            return List.of();
+            return Map.of(
+                    "error", true,
+                    "message", "查询用户 " + userId + " 的订单时后端服务异常, 这不是"
+                            + "\"该用户没有订单\"的意思。请稍后重试, 或告知用户稍后再查。"
+            );
         }
     }
 }
