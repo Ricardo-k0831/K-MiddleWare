@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
 
+    # ---------- 任务服务 (Java 控制面) ----------
+    # /chat 带 task_id 时把任务状态回调到这里。Java 是任务状态的唯一事实源,
+    # Python 只上报"我到了哪一步"。见 docs/task-state-machine.md。
+    km_task_service_url: str = "http://localhost:8083"
+    # 回调是旁路, 宁可丢弃也不要拖慢 Agent 主流程 —— 所以超时给得短。
+    km_task_service_timeout_seconds: float = 2.0
+
     # ---------- PostgreSQL ----------
     postgres_host: str = "localhost"
     postgres_port: int = 5432

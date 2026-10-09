@@ -23,6 +23,13 @@ from pydantic import BaseModel, Field
 from app.config import get_settings
 from app.graph.agent import build_agent
 from app.mcp_adapter import ToolProvider, build_tool_provider
+from app.task_state import (
+    COMPLETED,
+    FAILED,
+    THINKING,
+    TaskStateCallbackHandler,
+    TaskStateReporter,
+)
 
 # Windows 控制台默认 GBK, 中文日志会变成乱码。强制 UTF-8 输出。
 if hasattr(sys.stdout, "reconfigure"):
@@ -104,11 +111,27 @@ class ChatRequest(BaseModel):
         default="default",
         description="会话ID。同一个 thread_id 的多轮对话共享上下文",
     )
+    task_id: str | None = Field(
+        default=None,
+        description=(
+            "Java 侧建好的任务ID。给了就启用任务链路: 它同时作为 thread_id, "
+            "运行期间状态实时回调 Java, 终态也由这里上报。"
+            "不给则行为与 Phase1 完全一致。"
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
     reply: str
     thread_id: str
+    # 本轮实际调用过的工具名, 按调用顺序。
+    # 存在的意义是【可验证】: 只看 reply 判断不了链路是否健康 ——
+    # 工具失败时 Agent 会把错误当数据转述成一段通顺的中文, HTTP 200,
+    # 肉眼看像是成功了。验收脚本靠这个字段判断 Agent 有没有"选对工具"。
+    tool_calls: list[str] = Field(default_factory=list)
+    # 走任务链路时回显, 方便调用方和自己建的任务对上号。
+    # 不走任务链路时为 null —— 这个区别本身就是"哪条路径"的证据。
+    task_id: str | None = None
 
 
 # ============================================================
@@ -158,12 +181,35 @@ async def list_agent_tools() -> dict[str, Any]:
     }
 
 
+async def _drain_reporter(reporter: TaskStateReporter | None) -> None:
+    """排空上报队列, 且无论如何都不让收尾动作影响响应。
+
+    最后一条 COMPLETED / FAILED 是整个任务里最有价值的一条 —— 丢了它,
+    Java 侧会一直以为任务还在跑。所以要等它发完 (aclose 内部有排空等待)。
+
+    但等不到也不能报错: 上报是旁路, 旁路的收尾失败绝不该把一个成功的请求
+    变成 500。这正是设计文档里"上报失败绝不能影响主流程"那条约束的最后一段。
+    """
+    if reporter is None:
+        return
+    try:
+        await reporter.aclose()
+    except Exception:
+        logger.warning("状态上报收尾失败, 忽略", exc_info=True)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     """跑一轮 Agent。
 
     Phase1 先用非流式把链路跑通。流式输出 (SSE 推送 token) 是 Phase2 的事,
     到时候这里换成 StreamingResponse 即可, Agent 本身不用改。
+
+    两条路径并存:
+
+    * **不带 task_id** —— 与 Phase1 完全一致, 不回调任何外部服务
+    * **带 task_id** —— 任务链路。task_id 即 thread_id, 运行期间把状态回调给
+      Java, 终态也在这里上报
     """
     if state.agent is None:
         raise HTTPException(
@@ -171,21 +217,77 @@ async def chat(req: ChatRequest) -> ChatResponse:
             detail=f"Agent 未就绪: {state.startup_error}",
         )
 
-    config = {"configurable": {"thread_id": req.thread_id}}
+    settings = get_settings()
+
+    # 空串按"没给"处理。调用方从 JSON 里传个 "" 进来很常见, 让它走任务链路
+    # 会得到一个必定 404 的 task_id, 只会在日志里刷一片无用的警告。
+    task_id = (req.task_id or "").strip() or None
+
+    reporter: TaskStateReporter | None = None
+    callbacks: list[Any] = []
+    if task_id is not None:
+        reporter = TaskStateReporter(
+            settings.km_task_service_url,
+            task_id,
+            timeout=settings.km_task_service_timeout_seconds,
+        )
+        await reporter.start()
+        # 入口就报 THINKING: 这样即使 LLM 一次都没调起来 (直接抛错),
+        # 事件表里也留下了"任务开始跑过"的痕迹, 而不是一条都没有。
+        # 之后 on_llm_start 再报一次 THINKING 是幂等的, Java 不写重复事件。
+        reporter.report(THINKING, {"phase": "entry"})
+        callbacks.append(TaskStateCallbackHandler(reporter))
+
+    # 任务链路下 task_id 同时就是 LangGraph 的 thread_id —— 两者本来就是
+    # 同一个东西 ("这单业务"和"这张图跑到哪了"), 共用一个 ID 让断点续跑
+    # 不需要任何映射表。见 AgentTask 的类注释。
+    thread_id = task_id or req.thread_id
+    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    if callbacks:
+        config["callbacks"] = callbacks
+
     try:
         result = await state.agent.ainvoke(
             {"messages": [{"role": "user", "content": req.message}]},
             config=config,
         )
+
+        # ReAct 循环产出的最后一条消息就是最终答复
+        messages = result.get("messages", [])
+        reply = messages[-1].content if messages else ""
+
+        # 把整轮里所有 AIMessage 的 tool_calls 按顺序收集起来。
+        # 注意是从【整个 messages 列表】扫, 不是只看最后一条 ——
+        # ReAct 可能有多轮工具调用, 最后一条通常已经没有 tool_calls 了。
+        tool_calls: list[str] = []
+        for msg in messages:
+            for call in getattr(msg, "tool_calls", None) or []:
+                name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+                if name:
+                    tool_calls.append(name)
+
+        # ★ 终态由这里报, 不由 CallbackHandler 报 ★
+        # 只有这里知道这轮 invocation 到底成没成。工具报错【不】代表任务失败 ——
+        # ReAct 循环存在的意义就是从工具错误里恢复。详见 app/task_state.py
+        # 里那段 ★ 注释, 那里记着把它映射成 FAILED 会怎样永久毁掉一个成功的任务。
+        if reporter is not None:
+            reporter.report(COMPLETED, {"result": reply})
+
     except Exception as ex:
         logger.exception("Agent 执行失败")
+        if reporter is not None:
+            reporter.report(FAILED, {"error": describe_exception(ex)})
         raise HTTPException(
             status_code=500,
             detail=f"Agent 执行失败: {describe_exception(ex)}",
         ) from ex
+    finally:
+        # 无论成功还是失败都要排空 —— 尤其不能丢掉刚入队的那条终态。
+        await _drain_reporter(reporter)
 
-    # ReAct 循环产出的最后一条消息就是最终答复
-    messages = result.get("messages", [])
-    reply = messages[-1].content if messages else ""
-
-    return ChatResponse(reply=reply, thread_id=req.thread_id)
+    return ChatResponse(
+        reply=reply,
+        thread_id=thread_id,
+        tool_calls=tool_calls,
+        task_id=task_id,
+    )

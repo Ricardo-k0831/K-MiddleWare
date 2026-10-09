@@ -58,7 +58,11 @@ docker compose -f docker/docker-compose.yml up -d
 docker compose -f docker/docker-compose.yml ps   # 等全部 healthy
 ```
 
-拉起：MySQL 3306、Redis 6379、PostgreSQL(pgvector) 5432、RocketMQ 9876/10911。
+拉起：MySQL **3307**（容器内 3306，见下方说明）、Redis 6379、PostgreSQL(pgvector) 5432、RocketMQ 9876/10911。
+
+> MySQL 特意映射到宿主机 **3307**：本机若装了原生 MySQL（Windows 服务，默认占 3306），
+> 容器会因抢不到端口直接退出（`Exited (137)`）。容器内部仍是 3306，docker 网络内的服务
+> 照旧写 `mysql:3306`；宿主机上的 Java 服务连 `localhost:3307`。
 
 ### 2. 起 Java 控制面
 

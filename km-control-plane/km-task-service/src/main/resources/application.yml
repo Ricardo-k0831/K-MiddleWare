@@ -1,0 +1,33 @@
+server:
+  # 8083 —— 任务服务。8081 是 MCP 网关, 8082 是 mock 订单服务。
+  port: 8083
+
+spring:
+  application:
+    name: km-task-service
+
+  datasource:
+    # ★ 宿主机端口是 3307, 不是 3306 ★
+    # 本机装了原生 MySQL 8.4 (Windows 服务 MySQL84) 占着 3306,
+    # 所以 docker 里的 MySQL 映射到宿主机 3307。
+    # 细节见 docker/docker-compose.yml 里 mysql 段的注释。
+    #
+    # allowPublicKeyRetrieval=true 是必须的: MySQL 8 默认用
+    # caching_sha2_password 认证, 不开 SSL 时要允许客户端取公钥,
+    # 否则报 "Public Key Retrieval is not allowed"。
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3307}/${MYSQL_DB:km_control}?useUnicode=true&characterEncoding=utf8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+    username: ${MYSQL_USER:km}
+    password: ${MYSQL_PASSWORD:km_dev_pwd}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+mybatis-plus:
+  configuration:
+    # 数据库是 snake_case, Java 是 camelCase, 靠这个自动映射,
+    # 免得每个字段都写一遍 @TableField("agent_task_id")。
+    map-underscore-to-camel-case: true
+    # 开发期把 SQL 打出来。上线前关掉 —— 它会把参数值一起打到 stdout。
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+logging:
+  level:
+    com.km.task: DEBUG

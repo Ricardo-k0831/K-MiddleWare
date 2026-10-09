@@ -24,7 +24,11 @@ services:
       MYSQL_PASSWORD: km_dev_pwd
       TZ: Asia/Shanghai
     ports:
-      - "3306:3306"
+      # 宿主机 3307, 不是 3306 —— 本机装了原生 MySQL 8.4 (Windows 服务 MySQL84),
+      # 开机就占着 3306, 容器抢不到会被直接 SIGKILL (退出码 137)。
+      # 容器内部仍然是 3306, 所以 docker 网络里其他服务照旧写 mysql:3306;
+      # 只有【宿主机上跑的东西】(km-task-service 等 Java 服务) 才用 3307。
+      - "3307:3306"
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
@@ -88,12 +92,34 @@ services:
       - rocketmq-namesrv-logs:/home/rocketmq/logs
     command: sh mqnamesrv
 
+  # ★ 必须存在的辅助容器: 给两个具名卷改属主。
+  #
+  # 官方 apache/rocketmq 镜像默认以 rocketmq(uid 3000) 运行, 而 compose 新建的
+  # 具名卷属主是 root —— broker 一启动就写不了 store/logs, 直接退出(255),
+  # 然后被 restart 策略反复拉起来, 无限崩溃重启。
+  #
+  # 坑在于【报错完全指不到这里】: 日志里只有一串关停阶段的
+  # NullPointerException (ScheduleMessageService.configFilePath),
+  # 真正的权限错误被它盖掉了, 而且日志卷是空的 —— 因为它连日志都写不进去。
+  #
+  # 这个容器跑完就退出, broker 等它成功后再启动。
+  rocketmq-broker-init:
+    image: alpine
+    container_name: km-rocketmq-broker-init
+    command: chown -R 3000:3000 /store /logs
+    volumes:
+      - rocketmq-broker-store:/store
+      - rocketmq-broker-logs:/logs
+
   rocketmq-broker:
     image: apache/rocketmq:5.3.1
     container_name: km-rocketmq-broker
     restart: unless-stopped
     depends_on:
-      - rocketmq-namesrv
+      rocketmq-namesrv:
+        condition: service_started
+      rocketmq-broker-init:
+        condition: service_completed_successfully
     ports:
       - "10909:10909"   # VIP 通道
       - "10911:10911"   # broker 主端口

@@ -25,6 +25,8 @@
         <!-- Phase1 只要这两个。等真需要了再拆 km-gateway / km-task-service / km-common。 -->
         <module>km-mock-order-service</module>
         <module>km-mcp-server</module>
+        <!-- Phase2: 任务生命周期管理, 状态机的事实源 -->
+        <module>km-task-service</module>
     </modules>
 
     <properties>
@@ -33,6 +35,16 @@
 
         <!-- Spring AI 2.0.1 依赖 io.modelcontextprotocol.sdk:mcp:2.0.0 -->
         <spring-ai.version>2.0.1</spring-ai.version>
+
+        <!--
+          ★ 注意是 boot4-starter, 不是 boot3-starter ★
+          Spring Boot 4 跑在 Spring Framework 7 上, MyBatis 那条线也跟着换了:
+            mybatis-plus-spring-boot3-starter -> mybatis-spring 3.x
+            mybatis-plus-spring-boot4-starter -> mybatis-spring 4.0.0
+          用错 starter 不会给出"版本不匹配"这种明确报错, 而是在启动装配阶段
+          以各种奇怪的方式失败。
+        -->
+        <mybatis-plus.version>3.5.17</mybatis-plus.version>
     </properties>
 
     <dependencyManagement>
@@ -47,6 +59,13 @@
                 <version>${spring-ai.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+
+            <!-- MyBatis-Plus 同样不在 Boot 的 BOM 里, 一样要自己管 -->
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
+                <version>${mybatis-plus.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

@@ -19,6 +19,7 @@ import logging
 from typing import Any
 
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import create_react_agent
 
 from app.config import Settings
@@ -64,8 +65,23 @@ async def build_agent(provider: ToolProvider, settings: Settings) -> Any:
         logger.warning("Agent 启动时没有拿到任何工具, 请检查 MCP 网关是否可达")
 
     logger.info("Agent 已装配 %d 个工具", len(tools))
+
+    # 给图挂上 checkpointer, main.py 里传的
+    # config={"configurable": {"thread_id": ...}} 才真正有意义。
+    # 没有它, 那个 config 是【空转的】—— 每轮请求彼此独立, 多轮对话不成立。
+    #
+    # InMemorySaver = 进程内记忆: 单机开发够用, 但【进程一重启就丢】。
+    # 它只是让多轮对话"真起来"的第一步, 不是终点 ——
+    # 要持久化就换成 PostgresSaver (docker-compose 里的 pgvector 就是干这个的),
+    # 接口一致, 只改这一行。
+    #
+    # 边界: 这里存的是【对话消息历史】(LLM 的上下文记忆), 不是【任务的业务状态】。
+    # 后者一律回调 Java —— 见文件头部那条约定。
+    checkpointer = InMemorySaver()
+
     return create_react_agent(
         build_llm(settings),
         list(tools),
         prompt=SYSTEM_PROMPT,
+        checkpointer=checkpointer,
     )
