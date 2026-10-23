@@ -22,6 +22,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from app.config import Settings
 from app.mcp_adapter.base import ToolSpec
+from app.mcp_adapter.task_identity import TaskIdentityAuth
 
 logger = logging.getLogger(__name__)
 
@@ -49,24 +50,36 @@ class LangChainMcpToolProvider:
         """构造多 Server 连接配置。
         headers 是 Java 网关鉴权的入口 —— Phase2 这里会换成真实的
         Agent 身份 token, 网关据此决定这个 Agent 能看见哪些工具。
+
+        ★ auth 和 headers 是两种不同的东西, 别把任务身份挪到 headers 里 ★
+
+        headers 是【连接级】的: 构造时定死, 一个 client 一套, 之后改不了。
+        用它带 task_id 的后果是长驻的 Agent 进程会把任务 B 的工具调用记到
+        任务 A 名下 —— 而且审计里看不出来, 它不是缺数据, 是把数据记到了错
+        的地方。详见 task_identity 模块开头那节。
+
+        auth 是【请求级】的: TaskIdentityAuth 每个出站请求读一次当前的
+        ContextVar。同一个 MCP 会话因此能依次服务不同任务, 和 Java 侧
+        McpGatewayAuditConfig 逐 POST 抽取的语义对上。
+
+        两者的分工: Authorization 回答"你是哪个 Agent"(整个进程一个身份),
+        X-KM-Task-Id 回答"这次调用属于哪个任务"(每次调用都可能不同)。
         """
         return {
             # 订单服务 对应的 McpServer
             "km-order": {
                 "transport": TRANSPORT_STREAMABLE_HTTP,
-                #订单 MCP 网关的 URL（Java 侧 km-mcp-server, 端口 8081）
+                #订单服务所属 MCP 网关的 URL（Java 侧 km-mcp-server, 端口 8081）
                 "url": settings.mcp_order_server_url,
                 "headers": {
                     "Authorization": f"Bearer {settings.mcp_auth_token}",
                 },
+                # 逐请求透传任务身份。无状态, 可以安全地在多个 server 之间共用
+                # 同一个实例 —— 它读的是 ContextVar, 不持有任何自己的状态。
+                "auth": TaskIdentityAuth(),
                 "timeout": settings.mcp_tool_timeout_seconds,
             },
-            # 将来接更多存量服务时在这里加:
-            # "km-inventory": {
-            #     "transport": TRANSPORT_STREAMABLE_HTTP,
-            #     "url": settings.mcp_inventory_server_url,
-            #     ...
-            # },
+
         }
 
     #  LangChain 的BaseTool格式工具列表 -> 用户自定义修饰的ToolSpec格式工具列表, 业务代码可以灵活调用

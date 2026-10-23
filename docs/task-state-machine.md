@@ -131,21 +131,28 @@ PATCH  /api/tasks/{id}/status          状态上报（Python 调这个）
 
 ```json
 {
+  "traceId": "cffac16e00000000cffac16e00000000",
   "toStatus": "TOOL_CALLING",
   "source": "PYTHON_RUNTIME",
   "detail": { "toolName": "get_order_by_id", "arguments": {"orderId": "SO20260901001"} }
 }
 ```
 
+`traceId` **必填**，是本次执行的执行身份（建任务响应里的那个值）。Java 用它
+去 `agent_task_attempt` 找到对应的执行，再用那次执行上不可变的 `trace_id`
+给 `TASK_LIFECYCLE` 审计事件盖章。不带 → 400；对不上 → 409
+`EXECUTION_MISMATCH`。
+
 `source` 取值（与 `agent_task_event.source` 字段对应）：
 `JAVA_GATEWAY` / `PYTHON_RUNTIME` / `SYSTEM_RETRY`
 
-### 一次状态上报，Java 做四件事
+### 一次状态上报，Java 做五件事
 
-1. **校验流转合法性** —— 不合法则拒绝（返回 409），并记 WARN
-2. **写 MySQL** —— 更新 `agent_task.status`，同时向 `agent_task_event` 插一条（append-only）
-3. **更新 Redis** —— 缓存当前状态，供高频查询
-4. **终态时补 `finished_at`**，并（将来）触发 MQ 通知
+1. **校验执行身份** —— `traceId` 必须对应该任务的一次未闭链执行，否则 409
+2. **校验流转合法性** —— 不合法则拒绝（返回 409），并记 WARN
+3. **写 MySQL** —— 更新 `agent_task.status`，同时向 `agent_task_event` 插一条（append-only）
+4. **更新 Redis** —— 缓存当前状态，供高频查询
+5. **终态时补 `finished_at`、关闭 `agent_task_attempt`**，并（将来）触发 MQ 通知
 
 > `agent_task_event` 是 append-only 的：`agent_task.status` 记"现在是什么"，
 > 事件表记"怎么变成的"。审计和排查全靠它。
@@ -289,9 +296,9 @@ Phase 1 是用户**直接**调 Python：
 | # | 做什么 | 验证方式 | 依赖 |
 |---|---|---|---|
 | 1 | **起 docker**，MySQL 建表 ✅ | `docker compose ps` 全 healthy；`SHOW TABLES` 看到五张表 | 只有你能做 |
-| 2 | 新建 `km-task-service` :8083，任务 CRUD + 状态机校验 ✅ | `scripts/verify_task_service.py`（33 项断言，见下） | 1 |
+| 2 | 新建 `km-task-service` :8083，任务 CRUD + 状态机校验 ✅ | `scripts/verify_task_service.py`（40+ 项断言，见下） | 1 |
 | 3 | Python 加 `TaskStateCallbackHandler` ✅ | 单测：mock Java 端，断言上报序列 | — |
-| 4 | `/chat` 支持 `task_id`，挂上 callback + 上报终态 ✅ | `tests/test_chat_task_wiring.py`（13 项）+ 真链路跑通 | 2, 3 |
+| 4 | `/chat` 支持 `task_id`，挂上 callback + 上报终态 ✅ | `tests/test_chat_task_wiring.py`（27 项）+ 真链路跑通 | 2, 3 |
 | 5 | smoke test 加一条任务链路的用例 ✅ | `smoke_chat.py` 用例 T | 4 |
 
 **第 1 步是硬前置** —— 第 2 步之后全部依赖 MySQL。这也是为什么

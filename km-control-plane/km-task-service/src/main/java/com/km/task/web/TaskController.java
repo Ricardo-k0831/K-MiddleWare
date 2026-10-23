@@ -25,8 +25,11 @@ import java.util.List;
  *   POST   /api/tasks                  创建任务          -> 201
  *   GET    /api/tasks/{id}             查询任务          -> 200 / 404
  *   GET    /api/tasks/{id}/events      状态流转历史      -> 200 / 404
- *   PATCH  /api/tasks/{id}/status      状态上报          -> 200 / 404 / 409
+ *   PATCH  /api/tasks/{id}/status      状态上报          -> 200 / 400 / 404 / 409
  * </pre>
+ *
+ * <p>PATCH 的 409 有两种含义, 用错误码区分: {@code ILLEGAL_TRANSITION}
+ * (状态不能这么变) 和 {@code EXECUTION_MISMATCH} (traceId 不属于这个任务)。
  *
  * 职责边界: 这一层只做参数绑定和校验, 任何"能不能"的判断都在
  * {@link TaskService} / 状态机里。Controller 里出现 if 判断状态就是设计跑偏了。
@@ -43,6 +46,7 @@ public class TaskController {
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
+    // 并且自动生成 trace_id
     public AgentTask create(@Valid @RequestBody CreateTaskRequest request) {
         return taskService.create(
                 request.userId(),
@@ -73,6 +77,7 @@ public class TaskController {
                                   @Valid @RequestBody ReportStatusRequest request) {
         return taskService.reportStatus(
                 agentTaskId,
+                request.traceId(),
                 request.toStatus(),
                 request.sourceOrDefault(),
                 request.detail());

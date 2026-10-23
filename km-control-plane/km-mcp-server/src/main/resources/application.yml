@@ -39,11 +39,35 @@ spring:
         # 开发期把请求超时调大, 方便单步调试
         request-timeout: 60s
 
-# 存量微服务地址。将来接真实业务系统时只改这一行。
 km:
+  # 存量微服务地址。将来接真实业务系统时只改这一行。
   backend:
     order-service:
       base-url: http://localhost:8082
+
+  # 审计投递。装配代码在 km-audit-core 的 AuditAutoConfiguration 里,
+  # 网关这边只有这一份配置 + McpGatewayAuditConfig 里的那个 contextExtractor。
+  audit:
+    enabled: true
+    namesrv-addr: ${ROCKETMQ_NAMESRV:localhost:9876}
+
+    # ★ 生产者组名逐服务不同 ★
+    # 和 km-task-service 用同一个组名不会报错, 但两者同一个 broker 上互相
+    # 顶掉的可能性是存在的 (同一 producer group 只应有单实例)。分开命名
+    # 在控制台上也一眼能看出消息是谁发的。
+    producer-group: km-mcp-server-audit
+
+    # topic 必须和任务服务【完全一致】—— 四层汇聚到同一个数据源,
+    # 靠的就是这个 topic 名字对得上。这里写错不会报错, 只会让网关的审计
+    # 悄悄进到另一个 topic, 而那边没有消费者。
+    topic: KM_AUDIT
+
+    send-timeout-ms: 3000
+    retry-times: 0
+
+    # 开发期全采。将来真要调, 最该调下去的是 AGENT_RUNTIME 那层,
+    # 不是这里 —— MCP 工具调用一单就几次, 采没了就查不到"Agent 到底调了什么"。
+    default-sample-rate: 1.0
 
 logging:
   level:

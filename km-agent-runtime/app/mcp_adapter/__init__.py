@@ -7,13 +7,16 @@
 from app.config import Settings
 from app.mcp_adapter.base import ToolCallResult, ToolProvider, ToolSpec
 from app.mcp_adapter.langchain_provider import LangChainMcpToolProvider
+from app.mcp_adapter.task_identity import TaskIdentity, task_identity
 
 __all__ = [
     "LangChainMcpToolProvider",
+    "TaskIdentity",
     "ToolCallResult",
     "ToolProvider",
     "ToolSpec",
     "build_tool_provider",
+    "task_identity",
 ]
 
 

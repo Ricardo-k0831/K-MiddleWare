@@ -59,9 +59,27 @@ def make_reporter(fake: FakeJava) -> tuple[TaskStateReporter, httpx.AsyncClient]
     reporter = TaskStateReporter(
         base_url="http://fake-java:8083",
         task_id="T-1",
+        trace_id="tr-1",
         client=client,
     )
     return reporter, client
+
+
+def test_trace_id_is_required() -> None:
+    """trace_id 是 keyword-only 必填参数, 空值在【构造时】就炸。
+
+    这条守的是"身份不明的上报宁可发不出去": 给 trace_id 一个缺省值,
+    Java 就只能猜"大概是当前那次执行" —— 猜错不会报错, 只会让整条链路
+    的审计挂错地方。所以刻意不给默认值。
+    """
+    import pytest  # 局部导入: 整个文件只有这一处用到
+
+    with pytest.raises(TypeError):
+        # 位置参数全给, 唯独漏了 keyword-only 的 trace_id
+        TaskStateReporter("http://java:8083", "T-1")  # type: ignore[call-arg]
+
+    with pytest.raises(ValueError):
+        TaskStateReporter("http://java:8083", "T-1", trace_id="")
 
 
 # ----------------------------------------------------------------------
@@ -106,7 +124,10 @@ def test_java_unreachable_does_not_stop_later_reports() -> None:
     async def scenario() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(refuse))
         reporter = TaskStateReporter(
-            base_url="http://nowhere:9999", task_id="T-1", client=client
+            base_url="http://nowhere:9999",
+            task_id="T-1",
+            trace_id="tr-1",
+            client=client,
         )
         await reporter.start()
         reporter.report(THINKING, {})
@@ -204,7 +225,10 @@ def test_request_shape() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
         # base_url 故意带尾斜杠, 验证会被规整掉
         reporter = TaskStateReporter(
-            base_url="http://java:8083/", task_id="T-42", client=client
+            base_url="http://java:8083/",
+            task_id="T-42",
+            trace_id="tr-42",
+            client=client,
         )
         await reporter.start()
         reporter.report(TOOL_CALLING, {"toolName": "x"})
@@ -216,6 +240,8 @@ def test_request_shape() -> None:
     assert seen["method"] == "PATCH"
     assert seen["url"] == "http://java:8083/api/tasks/T-42/status"
     assert seen["body"] == {
+        # traceId 每次上报都带: Java 靠它定位 agent_task_attempt 里的那次执行
+        "traceId": "tr-42",
         "toStatus": TOOL_CALLING,
         "source": "PYTHON_RUNTIME",
         "detail": {"toolName": "x"},

@@ -28,6 +28,33 @@ mybatis-plus:
     # 开发期把 SQL 打出来。上线前关掉 —— 它会把参数值一起打到 stdout。
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
 
+# 审计投递 (见 com.km.task.audit.AuditPublisher)
+km:
+  audit:
+    enabled: true
+    # docker-compose 里 namesrv 映射到宿主机的 9876
+    namesrv-addr: ${ROCKETMQ_NAMESRV:localhost:9876}
+    producer-group: km-task-service-audit
+    # ★ 改这个名字 = 清空消费位点, 从头重放一遍 ★ 见 AuditProperties.consumerGroup
+    # 走环境变量是为了能不改文件就重放一次历史消息:
+    #   KM_AUDIT_CONSUMER_GROUP=km-audit-log-consumer-replay mvn spring-boot:run
+    consumer-group: ${KM_AUDIT_CONSUMER_GROUP:km-audit-log-consumer}
+    # 统一审计 topic —— 四层的事件都进这一个, 消费端只有一个入口
+    topic: KM_AUDIT
+    send-timeout-ms: 3000
+    # 审计可以丢, 所以不重试。理由见 AuditProperties.retryTimes 的注释。
+    retry-times: 0
+    #
+    # 分层采样。现在是开发期, 全采 —— 数据量小的时候采样只会让你查不到东西。
+    # 将来 AGENT_RUNTIME 的 LLM_CALL 量上来了, 单独把那层调下去即可, 例如:
+    #   default-sample-rate: 1.0
+    #   sample-rate:
+    #     AGENT_RUNTIME: 0.1
+    #
+    # 注意: 不管采样率配成多少, status != OK 的事件【永远上报】。
+    #
+    default-sample-rate: 1.0
+
 logging:
   level:
     com.km.task: DEBUG

@@ -1,7 +1,11 @@
 package com.km.mcp.tool;
 
+import com.km.audit.AuditEvent;
+import com.km.mcp.audit.CallStatus;
+import com.km.mcp.audit.McpToolAudit;
+import com.km.mcp.audit.TaskIdentity;
 import com.km.mcp.client.OrderServiceClient;
-import com.km.mcp.client.OrderServiceClient.OrderServiceException;
+import io.modelcontextprotocol.common.McpTransportContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.mcp.annotation.McpTool;
@@ -53,6 +57,30 @@ import java.util.Map;
  *
  * <p>绕法是包一层 object: {@code Map.of("count", n, "orders", list)}。
  * 将来加"库存列表""用户列表"之类的工具时同样要包。</p>
+ *
+ * <h3>多出来的那个 {@code McpTransportContext} 参数是干什么的</h3>
+ *
+ * 它不是给 LLM 看的, 也不进工具的入参 schema —— 协议实现识别出这个类型后,
+ * 会把<b>当前这次 HTTP 请求</b>的传输上下文注入进来, 里面装的是客户端
+ * 在请求头上带的任务身份 (见 {@code McpGatewayAuditConfig})。
+ *
+ * <p>这是"网关凭什么知道这次调用属于哪个任务"的最后一环:
+ * <pre>
+ *   Python 在请求头带 X-KM-Task-Id
+ *     -&gt; contextExtractor 抽成 McpTransportContext
+ *     -&gt; 注入到这里的参数
+ *     -&gt; TaskIdentity -&gt; AuditEvent.taskId -&gt; audit_log.agent_task_id
+ * </pre>
+ *
+ * <p>注意它和 {@code @McpToolParam} 参数的区别: 后者是<b>模型填的</b>,
+ * 前者是<b>传输层填的</b>。把 taskId 写成 {@code @McpToolParam} 让 LLM 填
+ * 是个看起来很自然、实际很糟的主意 —— 那等于让模型自己声明"我是哪个任务",
+ * 它完全可能填错或编一个, 而审计的全部价值就在这个字段上。
+ *
+ * <h3>为什么每个工具方法都要走 {@code audit.invoke}</h3>
+ *
+ * 见 {@link McpToolAudit} 的类注释: 这里吞异常的设计让 AOP 切面永远看到"成功",
+ * 所以审计点必须落在<b>方法内部</b>, 包住真正会失败的那一步。
  */
 @Component
 public class OrderMcpTools {
@@ -60,9 +88,11 @@ public class OrderMcpTools {
     private static final Logger log = LoggerFactory.getLogger(OrderMcpTools.class);
 
     private final OrderServiceClient orderServiceClient;
+    private final McpToolAudit audit;
 
-    public OrderMcpTools(OrderServiceClient orderServiceClient) {
+    public OrderMcpTools(OrderServiceClient orderServiceClient, McpToolAudit audit) {
         this.orderServiceClient = orderServiceClient;
+        this.audit = audit;
     }
 
     @McpTool(
@@ -76,19 +106,15 @@ public class OrderMcpTools {
     )
     public Map<String, Object> getOrderById(
             @McpToolParam(required = true, description = "订单号, 形如 SO20260901001")
-            String orderId) {
+            String orderId,
+            McpTransportContext transportContext) {
 
-        log.info("[MCP] get_order_by_id orderId={}", orderId);
-        try {
-            return orderServiceClient.getOrderById(orderId);
-        } catch (OrderServiceException ex) {
-            // 不抛异常, 返回结构化的自然语言错误 —— 让 Agent 有能力自我纠正
-            return Map.of(
-                    "error", true,
-                    "message", "没有找到订单号 " + orderId + " 对应的订单。请确认订单号是否正确, "
-                            + "或者改用 list_orders_by_user 按用户查询。"
-            );
-        }
+        TaskIdentity identity = TaskIdentity.from(transportContext);
+        log.info("[MCP] get_order_by_id orderId={} taskId={}", orderId, identity.taskId());
+
+        return audit.invoke(identity, "get_order_by_id", Map.of("orderId", orderId),
+                () -> orderServiceClient.getOrderById(orderId, identity),
+                ex -> orderLookupFailed(orderId, ex));
     }
 
     @McpTool(
@@ -102,22 +128,60 @@ public class OrderMcpTools {
     )
     public Map<String, Object> listOrdersByUser(
             @McpToolParam(required = true, description = "用户ID, 形如 U1001")
-            String userId) {
+            String userId,
+            McpTransportContext transportContext) {
 
-        log.info("[MCP] list_orders_by_user userId={}", userId);
-        try {
-            List<Map<String, Object>> orders = orderServiceClient.listOrdersByUser(userId);
-            // 必须包成 object, 不能直接返回 List —— 见类注释"返回值必须是 JSON object"
-            return Map.of("count", orders.size(), "orders", orders);
-        } catch (OrderServiceException ex) {
-            // 注意: 这里不能返回空列表。后端挂了和"该用户确实没有订单"是两回事,
-            // 返回空列表会让 Agent 把故障如实转述成"你没有订单", 是在骗用户。
-            log.warn("[MCP] list_orders_by_user 失败 userId={}", userId, ex);
+        TaskIdentity identity = TaskIdentity.from(transportContext);
+        log.info("[MCP] list_orders_by_user userId={} taskId={}", userId, identity.taskId());
+
+        return audit.invoke(identity, "list_orders_by_user", Map.of("userId", userId),
+                () -> {
+                    List<Map<String, Object>> orders = orderServiceClient.listOrdersByUser(userId, identity);
+                    // 必须包成 object, 不能直接返回 List —— 见类注释"返回值必须是 JSON object"
+                    return Map.of("count", orders.size(), "orders", orders);
+                },
+                ex -> {
+                    // 注意: 这里不能返回空列表。后端挂了和"该用户确实没有订单"是两回事,
+                    // 返回空列表会让 Agent 把故障如实转述成"你没有订单", 是在骗用户。
+                    return Map.of(
+                            "error", true,
+                            "message", "查询用户 " + userId + " 的订单时后端服务异常, 这不是"
+                                    + "\"该用户没有订单\"的意思。请稍后重试, 或告知用户稍后再查。"
+                    );
+                });
+    }
+
+    /**
+     * 根据Audit的状态字段, 分清是 后端故障 还是 业务故障
+     *
+     * <p><b>为什么要按异常类型分支</b> —— 这是这次改动里唯一一处对 Agent
+     * 可见的行为变化, 所以展开说。
+     *
+     * <p>改之前, 无论后端是"明确回了 404 没有这个订单"还是"根本连不上",
+     * Agent 拿到的都是同一句话: <i>"没有找到订单号 X 对应的订单"</i>。
+     * 对第二种情况, 这句话是<b>谎话</b> —— 后端挂了的时候, 网关根本不知道
+     * 这个订单存不存在。而 Agent 会忠实地把它转述给用户, 用户于是以为
+     * 自己的订单丢了。
+     *
+     * <p>这正是 {@link CallStatus} 里那条"4xx 不算 ERROR"规则的另一面:
+     * 既然系统知道两者不同, 就该让 Agent 也知道。判断依据是同一个方法,
+     * 所以"审计里记的"和"Agent 看到的"永远一致 —— 不会出现审计说是故障、
+     * 用户被告知"订单不存在"这种对不上的情况。
+     */
+    private static Map<String, Object> orderLookupFailed(String orderId, Throwable ex) {
+        if (AuditEvent.OK.equals(CallStatus.of(ex))) {
+            // 后端明确回答"没有", 这是一次成功的查询
             return Map.of(
                     "error", true,
-                    "message", "查询用户 " + userId + " 的订单时后端服务异常, 这不是"
-                            + "\"该用户没有订单\"的意思。请稍后重试, 或告知用户稍后再查。"
+                    "message", "没有找到订单号 " + orderId + " 对应的订单。请确认订单号是否正确, "
+                            + "或者改用 list_orders_by_user 按用户查询。"
             );
         }
+        log.warn("[MCP] get_order_by_id 后端异常 orderId={}", orderId, ex);
+        return Map.of(
+                "error", true,
+                "message", "查询订单 " + orderId + " 时后端服务异常, 这不能说明该订单不存在。"
+                        + "请稍后重试, 或告知用户稍后再查。"
+        );
     }
 }

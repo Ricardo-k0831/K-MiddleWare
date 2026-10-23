@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 # 刻意不做成 Enum: 这些值在 HTTP 报文里以字符串裸奔, 两端按字符串对齐,
 # 中间加一层 Enum 只会在序列化边界上多一次转换, 不换来任何安全。
 PENDING = "PENDING"
+
+
+
+
 THINKING = "THINKING"
 TOOL_CALLING = "TOOL_CALLING"
 COMPLETED = "COMPLETED"
@@ -60,11 +64,23 @@ class TaskStateReporter:
         self,
         base_url: str,
         task_id: str,
+        *,
+        trace_id: str,
         timeout: float = 2.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        # ★ trace_id 是【必填的 keyword-only 参数】, 不给缺省值 ★
+        #
+        # 它标识"这次执行", 而不是"这个任务": task 和 trace 是 1:N,
+        # 同一个任务重试会换 trace。缺省它就只能让 Java 去猜"大概是
+        # 当前那次执行吧" —— 猜错的时候不会报错, 只会有一条审计挂到
+        # 错误的链上。所以刻意不给默认值, 缺了就在这里 TypeError,
+        # 而不是让一条身份不明的上报悄悄发出去。
+        if not trace_id:
+            raise ValueError("trace_id 不能为空 —— 它标识这次执行, 由 Java 创建任务时生成")
         self._base_url = base_url.rstrip("/")
         self._task_id = task_id
+        self._trace_id = trace_id
         self._timeout = timeout
         # 允许注入 client, 测试时可以塞 MockTransport 进来, 不用起真服务
         self._client = client
@@ -75,12 +91,14 @@ class TaskStateReporter:
     def task_id(self) -> str:
         return self._task_id
 
-    # ------------------------------------------------------------------
-    #  对外
-    # ------------------------------------------------------------------
+    @property
+    def trace_id(self) -> str:
+        return self._trace_id
 
+
+    # 将目标状态和detail映射进行上报
     def report(self, to_status: str, detail: dict[str, Any] | None = None) -> None:
-        """入队一次状态上报。
+        """状态上报进行入队
 
         刻意做成【同步、非阻塞、不抛异常】的方法 —— 它会被
         on_llm_start / on_tool_start 这类跑在关键路径上的钩子调用,
@@ -88,6 +106,7 @@ class TaskStateReporter:
         """
         self._queue.put_nowait((to_status, detail or {}))
 
+    # 启动 worker
     async def start(self) -> None:
         """启动后台 worker。重复调用是安全的。"""
         if self._worker is None:
@@ -95,6 +114,7 @@ class TaskStateReporter:
                 self._run(), name=f"task-state-reporter-{self._task_id}"
             )
 
+    # 先排空 Queue, 再停掉 Worker
     async def aclose(self, drain_timeout: float = 5.0) -> None:
         """排空队列后停掉 worker。
 
@@ -105,6 +125,7 @@ class TaskStateReporter:
             return
 
         try:
+            # queue.join() 会阻塞直到队列里所有 item 都被 task_done()
             await asyncio.wait_for(self._queue.join(), timeout=drain_timeout)
         except TimeoutError:
             logger.warning(
@@ -129,8 +150,11 @@ class TaskStateReporter:
         client = self._client or httpx.AsyncClient(timeout=self._timeout)
         try:
             while True:
+                # 1. 从队列取一条 (await, 没东西就挂起等)
                 to_status, detail = await self._queue.get()
                 try:
+
+                    # 2. 串行发 HTTP POST 给 Java 8083 TASK_SERVICE
                     await self._patch(client, to_status, detail)
                 except Exception as ex:  # noqa: BLE001 — 见下面 ★, 盲捕是刻意的
                     # ★ 吞掉。上报是旁路, 它失败不该让 Agent 崩。
@@ -142,13 +166,18 @@ class TaskStateReporter:
         finally:
             if owns_client:
                 await client.aclose()
-
+    # 状态上报
     async def _patch(
         self, client: httpx.AsyncClient, to_status: str, detail: dict[str, Any]
     ) -> None:
         response = await client.patch(
             f"{self._base_url}/api/tasks/{self._task_id}/status",
             json={
+                # ★ traceId 每次上报都带 ★
+                # Java 用它找到 agent_task_attempt 里对应的那次执行,
+                # 再用那个执行上的不可变 trace 给 TASK_LIFECYCLE 盖章。
+                # 缺了它会 400 —— 这是有意的: 身份不明的上报宁可被拒。
+                "traceId": self._trace_id,
                 "toStatus": to_status,
                 "source": "PYTHON_RUNTIME",
                 "detail": detail,
@@ -165,7 +194,7 @@ class TaskStateReporter:
                 response.text[:200],
             )
 
-
+# 当agent的任务状态 Thinking ToolCalling 变更时, 自动将状态进行映射上报
 class TaskStateCallbackHandler(AsyncCallbackHandler):
     """把 LangChain 的运行时事件映射成任务状态上报。
 

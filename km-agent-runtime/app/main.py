@@ -12,17 +12,20 @@ MCP 握手和 tools/list 是有成本的, 每轮对话重来一次会让响应�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from app.audit import AuditCallbackHandler, AuditReporter
 from app.config import get_settings
 from app.graph.agent import build_agent
-from app.mcp_adapter import ToolProvider, build_tool_provider
+from app.mcp_adapter import TaskIdentity, ToolProvider, build_tool_provider, task_identity
 from app.task_state import (
     COMPLETED,
     FAILED,
@@ -104,7 +107,7 @@ app = FastAPI(
 # ============================================================
 #  模型
 # ============================================================
-
+# 聊天的请求模型, 内部有 message,thread_id, task_id, trace_id, tenant_id, actor 这些字段
 class ChatRequest(BaseModel):
     message: str = Field(..., description="用户输入")
     thread_id: str = Field(
@@ -119,6 +122,38 @@ class ChatRequest(BaseModel):
             "不给则行为与 Phase1 完全一致。"
         ),
     )
+    # ---- 下面三个是【任务身份】, 只在带了 task_id 时有意义 ----
+    #
+    # ★ 它们由调用方从 POST /api/tasks 的响应里原样转交, Python 不生成 ★
+    #
+    # traceId 的唯一生成点是 Java 的 TaskService.create() —— 准确说是"任务
+    # 第一次执行"的生成点 (重试会另生成一个)。Python 这边自己造一个的话,
+    # 会得到两个 traceId: 任务表里是 Java 的, 审计表里是 Python 的,
+    # 同一遍执行被劈成两条对不上的链路。
+    #
+    # 那"缺省时兜底生成一个"呢? 也不行 —— 缺一个值是诚实的缺失 (查询时
+    # 一眼看得出来), 值不一致是谎言 (只有交叉比对两张表才会暴露)。
+    trace_id: str | None = Field(
+        default=None,
+        description=(
+            "链路ID, 来自任务创建响应。审计按它串起【这一次执行】的所有事件 "
+            "(跨运行时/网关/存量服务); 它不跨任务 —— 同一会话里的多个任务 "
+            "各有自己的 trace_id, 会话维度请用 session_id。"
+            "★ 带 task_id 时必填 ★ 缺了直接 400: 没有执行身份, 这次运行的"
+            "每条上报都无法归位。"
+        ),
+    )
+    tenant_id: str | None = Field(
+        default=None,
+        description="租户ID, 来自任务创建响应。不给则由 Java 侧填默认租户",
+    )
+    actor: str | None = Field(
+        default=None,
+        description=(
+            "操作者。在 Java 侧就是 agent_task.user_id, 在审计里那一列叫 actor "
+            "—— 这里跟着审计的叫法走, 免得同一份数据在两个系统里两个名字"
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
@@ -126,12 +161,15 @@ class ChatResponse(BaseModel):
     thread_id: str
     # 本轮实际调用过的工具名, 按调用顺序。
     # 存在的意义是【可验证】: 只看 reply 判断不了链路是否健康 ——
-    # 工具失败时 Agent 会把错误当数据转述成一段通顺的中文, HTTP 200,
+    # 工具失败时 Agent 会把错误当数据转述成一段通顺的中文(降级处理), HTTP 200,
     # 肉眼看像是成功了。验收脚本靠这个字段判断 Agent 有没有"选对工具"。
     tool_calls: list[str] = Field(default_factory=list)
     # 走任务链路时回显, 方便调用方和自己建的任务对上号。
     # 不走任务链路时为 null —— 这个区别本身就是"哪条路径"的证据。
     task_id: str | None = None
+    # 同上的理由: 回显它, 验收脚本才能拿它去 audit_log 里对账
+    # ("我发出去的身份"和"数据库收到的身份"是不是同一个)。
+    trace_id: str | None = None
 
 
 # ============================================================
@@ -198,6 +236,91 @@ async def _drain_reporter(reporter: TaskStateReporter | None) -> None:
         logger.warning("状态上报收尾失败, 忽略", exc_info=True)
 
 
+async def _drain_audit(audit: AuditReporter | None) -> None:
+    """排空审计队列。失败一律吞掉, 理由同上。
+
+    和状态上报唯一的区别是【期望值】: 状态那条"丢了很严重", 审计这条
+    "丢几条可以接受"。所以审计的排空超时更短 —— 让调用方为可丢的记录
+    多等几秒是不能接受的, 而让最有价值那条状态多等几秒可以。
+    """
+    if audit is None:
+        return
+    try:
+        await audit.aclose()
+    except Exception:
+        logger.warning("审计上报收尾失败, 忽略", exc_info=True)
+
+
+async def _verify_task_identity(
+    settings: Any,
+    task_id: str,
+    trace_id: str,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """入口核对: 这个 trace 是不是这个任务【当前这次执行】的身份。
+
+    ★ 为什么要在入口做, 而不是等 Java 在 PATCH 上报时再拒 ★
+
+    两种做法的成本完全不同:
+
+    * 只在上报时拒 —— Agent 会先花几十秒把 LLM 和工具全跑完, 然后每一条
+      状态上报、每一条审计都被拒。用户等到的是一份正常答案, 而库里这个
+      任务停在 PENDING, 审计里一条 TASK_LIFECYCLE 都没有。
+    * 在入口拒 —— 一个 GET, 几十毫秒, 调用方当场看到 409。
+
+    代价是 Python 任务链路从此【硬依赖】Java。这是有意的: 任务链路的
+    唯一事实源就是 Java, Java 不在的时候本来也上报不了任何东西; 与其
+    "跑完但什么都没记下", 不如一开始就说"现在跑不了"。
+
+    核对的是 {@code agent_task.traceId}(最近一次执行的 trace)。重试落地后
+    它应当换成"该 trace 对应的 attempt 是否还开着", 那需要任务服务再开一个
+    查询接口 —— 现在 1:1, 用任务上的字段足够, 不做多余的接口。
+    """
+    url = f"{settings.km_task_service_url.rstrip('/')}/api/tasks/{task_id}"
+    # 允许注入 client: 测试塞 MockTransport 进来, 和 TaskStateReporter 同一个写法。
+    owns_client = client is None
+    client = client or httpx.AsyncClient(
+        timeout=settings.km_task_service_timeout_seconds
+    )
+    try:
+        response = await client.get(url)
+    except httpx.HTTPError as ex:
+        raise HTTPException(
+            status_code=502,
+            detail=f"任务服务不可达, 无法校验执行身份: {describe_exception(ex)}",
+        ) from ex
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"任务不存在: task_id={task_id}")
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"任务服务返回 HTTP {response.status_code}: {response.text[:200]}",
+        )
+
+    try:
+        actual_trace_id = (response.json() or {}).get("traceId")
+    except ValueError as ex:
+        raise HTTPException(
+            status_code=502,
+            detail=f"任务服务返回的不是合法 JSON: {response.text[:200]}",
+        ) from ex
+
+    if actual_trace_id != trace_id:
+        # 409 而不是 400: 报文本身合法, 是"执行身份"与任务当前状态冲突 ——
+        # 和 Java 侧 EXECUTION_MISMATCH 用同一个码。
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"执行身份不匹配: task_id={task_id} 当前执行是 {actual_trace_id}, "
+                f"请求带的是 {trace_id}。请用任务创建响应里的 traceId。"
+            ),
+        )
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     """跑一轮 Agent。
@@ -209,7 +332,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     * **不带 task_id** —— 与 Phase1 完全一致, 不回调任何外部服务
     * **带 task_id** —— 任务链路。task_id 即 thread_id, 运行期间把状态回调给
-      Java, 终态也在这里上报
+      Java, 终态也在这里上报; 同时按事件上报审计 (LLM 调用 / 工具调用)
     """
     if state.agent is None:
         raise HTTPException(
@@ -222,13 +345,47 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # 空串按"没给"处理。调用方从 JSON 里传个 "" 进来很常见, 让它走任务链路
     # 会得到一个必定 404 的 task_id, 只会在日志里刷一片无用的警告。
     task_id = (req.task_id or "").strip() or None
+    trace_id = (req.trace_id or "").strip() or None
+
+    if task_id is not None:
+        # ★ 任务链路必须带 trace_id ★
+        # 不带的话, Java 只能拿"任务表上最近一次执行"去猜。猜错不会报错,
+        # 只会让这次运行的每一条审计挂到别的执行/别的任务名下。宁可 400。
+        if trace_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="带 task_id 时必须同时带 trace_id (来自任务创建响应)",
+            )
+        # ★ 入口校验, 失败即止 ★ —— 在拉起任何上报器、跑任何 LLM 之前。
+        await _verify_task_identity(settings, task_id, trace_id)
+
+    # 从传入的请求中获取任务身份
+    # 任务身份的作用: 让 Java 网关知道接下来的工具调用属于哪个任务。
+    # 只在任务链路下绑 —— 不带 task_id 的调用没有身份可绑, 走匿名。
+    identity = (
+        TaskIdentity(
+            task_id=task_id,
+            trace_id=trace_id,
+            tenant_id=(req.tenant_id or "").strip() or None,
+            actor=(req.actor or "").strip() or None,
+        )
+        if task_id is not None
+        else None
+    )
 
     reporter: TaskStateReporter | None = None
+    audit: AuditReporter | None = None
+
+    # 回调函数列表, 用于在任务链路下的状态上报和审计上报
     callbacks: list[Any] = []
+
     if task_id is not None:
         reporter = TaskStateReporter(
             settings.km_task_service_url,
             task_id,
+            # trace_id 是执行身份: Java 用它找 agent_task_attempt,
+            # 缺了它整条上报会被拒 —— 上面入口已经确保了它非空。
+            trace_id=trace_id,
             timeout=settings.km_task_service_timeout_seconds,
         )
         await reporter.start()
@@ -238,19 +395,61 @@ async def chat(req: ChatRequest) -> ChatResponse:
         reporter.report(THINKING, {"phase": "entry"})
         callbacks.append(TaskStateCallbackHandler(reporter))
 
+        # 审计是第二条旁路, 和状态上报并列 —— 两者都在任务链路下才建,
+        # 不带 task_id 的调用一条外部请求都不发 (有测试钉着这一点)。
+        #
+        # ★ 为什么审计只在任务链路下开 ★
+        #
+        # 因为【审计的每条记录都要能归属到一个任务】。没有 task_id 的调用
+        # 记出来是一堆查不到一起的匿名行 —— 那种数据不是"少", 是"没法用",
+        # 还会把审计表的信噪比拉低。宁可没有, 也不要一堆解释不了的行。
+        audit = AuditReporter(
+            settings.km_task_service_url,
+            task_id=task_id,
+            # 身份原样透传, 一个都不补 —— 理由见 ChatRequest.trace_id 那段
+            trace_id=identity.trace_id if identity is not None else None,
+            tenant_id=identity.tenant_id if identity is not None else None,
+            actor=identity.actor if identity is not None else None,
+            timeout=settings.km_task_service_timeout_seconds,
+        )
+        await audit.start()
+        # 审计上报回调函数, 用于在任务链路下的审计上报
+        callbacks.append(AuditCallbackHandler(audit, default_model=settings.llm_model))
+
     # 任务链路下 task_id 同时就是 LangGraph 的 thread_id —— 两者本来就是
     # 同一个东西 ("这单业务"和"这张图跑到哪了"), 共用一个 ID 让断点续跑
     # 不需要任何映射表。见 AgentTask 的类注释。
+    #
+    # ★ 代价: 对话记忆是按【任务】隔离的, 不是按【会话】★
+    # 同一个 session 里连问两件事 = 两个 task = 两个 thread, 第二个任务
+    # 看不见第一个任务的上下文。现在的"会话"只有 agent_task.session_id
+    # 这个数据库标签, 运行时并不认识它。
+    # 要做到会话级记忆, thread_id 应当是 session_id, 用 LangGraph 的
+    # checkpoint_ns 区分任务 —— 那是 Phase 2 的事。这里写清楚, 是为了
+    # 避免误以为"同一会话的多个任务共享记忆"而按这个前提去设计功能。
     thread_id = task_id or req.thread_id
     config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
     if callbacks:
         config["callbacks"] = callbacks
 
     try:
-        result = await state.agent.ainvoke(
-            {"messages": [{"role": "user", "content": req.message}]},
-            config=config,
-        )
+        # ★ 身份的作用域要【恰好】包住这次 invocation ★
+        #
+        # 往小了说: 不包的话, 这一轮里所有工具调用都会匿名 —— 网关收不到
+        # X-KM-Task-Id, 审计里的 agent_task_id 全是 NULL。
+        #
+        # 往大了说: 包住整个请求处理 (或者干脆不还原) 的话, 并发请求之间
+        # 会串号 —— 而且串得毫无规律, 只在压测时才看得出来。
+        # contextvars 保证了这里按任务隔离, `with` 保证出了块就还原。
+        #
+        # Agent 内部对工具调用的调度 (LangGraph 的 ReAct 循环、它起的
+        # 子任务) 都在这个块里, ContextVar 会自动传播进去, 不需要把身份
+        # 当参数一层层往下传。
+        with task_identity(identity):
+            result = await state.agent.ainvoke(
+                {"messages": [{"role": "user", "content": req.message}]},
+                config=config,
+            )
 
         # ReAct 循环产出的最后一条消息就是最终答复
         messages = result.get("messages", [])
@@ -283,11 +482,16 @@ async def chat(req: ChatRequest) -> ChatResponse:
         ) from ex
     finally:
         # 无论成功还是失败都要排空 —— 尤其不能丢掉刚入队的那条终态。
-        await _drain_reporter(reporter)
+        # 两条旁路并发收尾, 等待时间不叠加 (它们之间没有任何依赖)。
+        await asyncio.gather(
+            _drain_reporter(reporter),
+            _drain_audit(audit),
+        )
 
     return ChatResponse(
         reply=reply,
         thread_id=thread_id,
         tool_calls=tool_calls,
         task_id=task_id,
+        trace_id=identity.trace_id if identity is not None else None,
     )

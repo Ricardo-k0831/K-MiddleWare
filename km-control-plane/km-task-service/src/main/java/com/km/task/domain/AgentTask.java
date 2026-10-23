@@ -23,6 +23,16 @@ import java.time.LocalDateTime;
  * 多一层映射, 多一处可能不一致的地方, 收益为零。
  * 所以 {@code checkpointRef} 字段现在【故意留空】, 留给将来
  * "一个任务对应多个 checkpoint 分支"的场景。
+ *
+ * <h3>代价: 对话记忆按任务隔离, 不是按会话</h3>
+ *
+ * <p>task_id 就是 thread_id, 意味着"会话"在运行时并不存在: 同一个
+ * {@code sessionId} 下的两个任务各有一份独立的 LangGraph 记忆, 第二个任务
+ * 看不见第一个任务的上下文。{@code sessionId} 现在只是一个可查询的数据库标签。
+ *
+ * <p>要做到会话级记忆, thread_id 应当换成 {@code sessionId}, 任务维度用
+ * LangGraph 的 {@code checkpoint_ns} 区分 —— 等真需要跨任务上下文时再做。
+ * 这里写明, 是为了避免按"同一会话共享记忆"这个错误前提去设计功能。
  */
 @TableName("agent_task")
 public class AgentTask {
@@ -35,10 +45,15 @@ public class AgentTask {
 
     private String userId;
 
-    /** 会话 ID, 一个会话含多轮任务 */
+    /** 会话 ID。跨任务的关联用它 —— 不要用 traceId 把多个任务串起来 */
     private String sessionId;
 
-    /** OTel traceId, 跨 Java/Python 透传 */
+    /**
+     * 【最近一次执行】的 traceId, 跨 Java/Python 透传。
+     *
+     * <p>它不是"任务的 ID": 任务和调用链是 1:N (每次重试一条新链), 见
+     * {@code TaskService.newTraceId()}。现在重试还没实现, 所以实际是 1:1。
+     */
     private String traceId;
 
     /** 用户原始输入 (脱敏后) */

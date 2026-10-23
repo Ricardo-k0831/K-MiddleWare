@@ -52,6 +52,30 @@
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
+        <!--
+          审计信封 + 投递器。各层共用的一份契约, 见该模块自己的 description。
+        -->
+        <dependency>
+            <groupId>com.km</groupId>
+            <artifactId>km-audit-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!--
+          审计事件投递。用原生 client 而非 boot starter, 理由见父 pom 的
+          rocketmq.version 注释。
+
+          ★ 这个依赖 km-audit-core 已经传递进来了, 这里显式再声明一次是
+          故意的 ★: 本服务的 AuditLogConsumer 直接 import 了
+          DefaultMQPushConsumer / MessageExt。直接使用的类型就该直接声明依赖,
+          否则哪天 km-audit-core 换掉 MQ 实现, 这里会在编译期以一种
+          莫名其妙的方式挂掉。
+        -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-client</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

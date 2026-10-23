@@ -89,6 +89,11 @@ def check(name: str, ok: bool, detail: str = "") -> None:
                 print(f"         {line}")
 
 
+# 建任务时响应里的 traceId 就是这次执行的身份, 后面每次上报都要带上。
+# 存成映射而不是让 create_task 改返回类型: 所有老用例都不用动。
+TRACES: dict[str, str] = {}
+
+
 def create_task(**overrides) -> str:
     body = {
         "userId": "U1001",
@@ -98,7 +103,22 @@ def create_task(**overrides) -> str:
     body.update(overrides)
     status, resp = call("POST", "/api/tasks", body)
     assert status == 201, f"建任务失败: HTTP {status} {resp}"
+    assert resp.get("traceId"), f"建任务的响应里没有 traceId: {resp}"
+    TRACES[resp["agentTaskId"]] = resp["traceId"]
     return resp["agentTaskId"]
+
+
+def report(task_id: str, to_status: str, detail: dict | None = None,
+           *, trace_id: str | None = None) -> tuple[int, dict]:
+    """上报一次状态。默认带上这个任务建任务时拿到的 traceId。
+
+    traceId 是执行身份, 不是可选项 —— 和 Python 运行时那边一致, 缺了会被
+    Java 以 400 拒掉。要验"缺 trace"或"错 trace"时显式传 trace_id。
+    """
+    body: dict = {"toStatus": to_status, "traceId": trace_id or TRACES[task_id]}
+    if detail is not None:
+        body["detail"] = detail
+    return call("PATCH", f"/api/tasks/{task_id}/status", body)
 
 
 def events_of(task_id: str) -> list[dict]:
@@ -152,8 +172,7 @@ def case_happy_path() -> None:
         ("THINKING", {"phase": "llm"}),
         ("COMPLETED", {"result": "订单 SO20260901001 已发货"}),
     ]:
-        code, resp = call("PATCH", f"/api/tasks/{task_id}/status",
-                          {"toStatus": to_status, "detail": detail})
+        code, resp = report(task_id, to_status, detail)
         check(f"上报 {to_status} 返回 200", code == 200, f"HTTP {code}: {resp}")
 
     code, task = call("GET", f"/api/tasks/{task_id}")
@@ -182,8 +201,7 @@ def case_illegal_transition() -> None:
     print("\n用例 2: 非法流转必须被拒 (PENDING 不能直接到 TOOL_CALLING)")
 
     task_id = create_task()
-    code, resp = call("PATCH", f"/api/tasks/{task_id}/status",
-                      {"toStatus": "TOOL_CALLING", "detail": {}})
+    code, resp = report(task_id, "TOOL_CALLING", {})
     check("跳级上报返回 409", code == 409, f"HTTP {code}: {resp}")
     check("错误码为 ILLEGAL_TRANSITION", resp.get("error") == "ILLEGAL_TRANSITION",
           f"实际 {resp.get('error')!r}")
@@ -199,11 +217,10 @@ def case_terminal_locked() -> None:
     print("\n用例 3: 终态必须锁死")
 
     task_id = create_task()
-    call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "THINKING"})
-    call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "FAILED",
-                                                   "detail": {"error": "工具超时"}})
+    report(task_id, "THINKING")
+    report(task_id, "FAILED", {"error": "工具超时"})
 
-    code, resp = call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "THINKING"})
+    code, resp = report(task_id, "THINKING")
     check("FAILED 之后不能再回到 THINKING (409)", code == 409, f"HTTP {code}: {resp}")
 
     _, task = call("GET", f"/api/tasks/{task_id}")
@@ -216,12 +233,11 @@ def case_idempotent() -> None:
     print("\n用例 4: 幂等上报 —— 返回 200 但【不写事件表】")
 
     task_id = create_task()
-    call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "THINKING"})
+    report(task_id, "THINKING")
     before = len(events_of(task_id))
 
     for _ in range(3):
-        code, _resp = call("PATCH", f"/api/tasks/{task_id}/status",
-                           {"toStatus": "THINKING", "detail": {"phase": "llm"}})
+        code, _resp = report(task_id, "THINKING", {"phase": "llm"})
         check("重复上报同一状态返回 200", code == 200, f"HTTP {code}")
 
     after = len(events_of(task_id))
@@ -229,8 +245,8 @@ def case_idempotent() -> None:
           f"上报 3 次后事件数从 {before} 变成 {after} —— 事件表被重放污染了")
 
     # 终态的同态上报也应该是幂等, 不是 409
-    call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "COMPLETED"})
-    code, _ = call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "COMPLETED"})
+    report(task_id, "COMPLETED")
+    code, _ = report(task_id, "COMPLETED")
     check("终态重复上报返回 200 (幂等), 不是 409", code == 200, f"HTTP {code}")
 
 
@@ -244,8 +260,7 @@ def case_detail_roundtrip() -> None:
         "备注": "中文键名也不能坏",
         "extra": None,
     }
-    call("PATCH", f"/api/tasks/{task_id}/status",
-         {"toStatus": "THINKING", "detail": payload})
+    report(task_id, "THINKING", payload)
 
     evs = events_of(task_id)
     stored = evs[-1].get("detail")
@@ -269,7 +284,7 @@ def case_concurrent_cas() -> None:
     #   (b) 不能有两条事件有相同的 fromStatus
     # (b) 就是 CAS 失效的指纹, 和调度顺序无关, 所以这个用例不会 flaky。
     task_id = create_task()
-    call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "THINKING"})
+    report(task_id, "THINKING")
     before = len(events_of(task_id))
 
     # TOOL_CALLING 和 COMPLETED 在 THINKING 状态下都合法, 所以冲突必须由 CAS 解决,
@@ -277,7 +292,7 @@ def case_concurrent_cas() -> None:
     targets = ["TOOL_CALLING", "COMPLETED"] * 3
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
         futures = [
-            pool.submit(call, "PATCH", f"/api/tasks/{task_id}/status", {"toStatus": t})
+            pool.submit(report, task_id, t)
             for t in targets
         ]
         codes = [f.result()[0] for f in futures]
@@ -326,8 +341,42 @@ def case_validation() -> None:
           f"实际 {resp.get('error')!r}")
 
     task_id = create_task()
-    code, resp = call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "不存在的状态"})
+    code, resp = report(task_id, "不存在的状态")
     check("非法枚举值返回 400", code == 400, f"HTTP {code}: {resp}")
+
+
+def case_execution_identity() -> None:
+    print("\n用例 9: 执行身份 (traceId) 必须被校验, 而不是靠推断")
+
+    task_id = create_task()
+    correct = TRACES[task_id]
+    other_task = create_task()
+    other_trace = TRACES[other_task]
+
+    code, resp = call("PATCH", f"/api/tasks/{task_id}/status", {"toStatus": "THINKING"})
+    check("缺 traceId 返回 400", code == 400, f"HTTP {code}: {resp}")
+    check("错误码为 INVALID_REQUEST", resp.get("error") == "INVALID_REQUEST",
+          f"实际 {resp.get('error')!r}")
+
+    code, resp = report(task_id, "THINKING", trace_id="并不存在的trace")
+    check("不存在的 trace 返回 409", code == 409, f"HTTP {code}: {resp}")
+    check("错误码为 EXECUTION_MISMATCH", resp.get("error") == "EXECUTION_MISMATCH",
+          f"实际 {resp.get('error')!r}")
+
+    code, resp = report(task_id, "THINKING", trace_id=other_trace)
+    check("拿别的任务的 trace 上报返回 409", code == 409, f"HTTP {code}: {resp}")
+    check("被拒的上报没有改动任务状态", call("GET", f"/api/tasks/{task_id}")[1]["status"] == "PENDING")
+
+    code, resp = report(task_id, "THINKING", trace_id=correct)
+    check("带正确的 trace 正常流转", code == 200, f"HTTP {code}: {resp}")
+
+    # 闭链之后: 同一个 trace 的同态重复上报仍然幂等 (超时重发),
+    # 但它不能再把任务推到别的状态。
+    report(task_id, "COMPLETED", trace_id=correct)
+    code, _ = report(task_id, "COMPLETED", trace_id=correct)
+    check("闭链后重复终态上报仍返回 200", code == 200, f"HTTP {code}")
+    code, resp = report(task_id, "THINKING", trace_id=correct)
+    check("闭链后新的状态上报返回 409", code == 409, f"HTTP {code}: {resp}")
 
 
 def main() -> int:
@@ -351,6 +400,7 @@ def main() -> int:
         case_concurrent_cas,
         case_not_found,
         case_validation,
+        case_execution_identity,
     ):
         try:
             case()

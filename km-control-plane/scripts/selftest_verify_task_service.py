@@ -105,6 +105,9 @@ class FakeService:
         task_id = uuid.uuid4().hex
         self.tasks[task_id] = {
             "agentTaskId": task_id,
+            # 生成点只有这里 —— 和真服务一样, 建任务时确定本次执行的身份。
+            # 上报时不带它 / 带了别的任务的, 都必须被拒 (见 report)。
+            "traceId": uuid.uuid4().hex,
             "tenantId": body.get("tenantId") or "default",
             "userId": body["userId"],
             "sessionId": body.get("sessionId"),
@@ -124,12 +127,22 @@ class FakeService:
 
     def report(self, task_id: str, body: dict) -> tuple[int, dict]:
         to = body.get("toStatus")
+        trace_id = (body.get("traceId") or "").strip()
+        if not trace_id:
+            # 真服务里这是 Bean Validation 拦下的, 返回 INVALID_REQUEST
+            return 400, {"error": "INVALID_REQUEST", "message": "traceId: 不能为空"}
         if to not in ALL_STATUSES:
             return 400, {"error": "MALFORMED_BODY", "message": f"未知的状态值: {to!r}"}
         detail = body.get("detail") or {}
 
         if task_id not in self.tasks:
             return 404, {"error": "TASK_NOT_FOUND", "message": task_id}
+
+        # ★ 执行身份 ★ 必须是这个任务当前那次执行的 trace。
+        # 拿别的任务的 trace 上报, 事件会被记到本任务头上 —— 必须 409。
+        if self.tasks[task_id].get("traceId") != trace_id:
+            return 409, {"error": "EXECUTION_MISMATCH",
+                         "message": f"执行身份不匹配: task={task_id} trace={trace_id}"}
 
         # ★ 变异点: 关掉 CAS 时, "读"和"写"之间刻意留一个窗口,
         #   让并发请求真的能互相覆盖。真服务里这个窗口是天然存在的。

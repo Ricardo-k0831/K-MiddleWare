@@ -1,5 +1,6 @@
 package com.km.task.web;
 
+import com.km.task.error.ExecutionMismatchException;
 import com.km.task.error.IllegalTaskTransitionException;
 import com.km.task.error.TaskNotFoundException;
 import org.slf4j.Logger;
@@ -49,6 +50,19 @@ public class ApiExceptionHandler {
         log.warn("状态流转被拒: {}", ex.getMessage());
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(new ApiError("ILLEGAL_TRANSITION", ex.getMessage()));
+    }
+
+    /**
+     * 状态上报的 traceId 和任务对不上。
+     *
+     * <p>返回 409 而不是 400: 报文本身是合法的, 是"执行身份"冲突。
+     * 调用方 (Python) 记 WARN 即可 —— 重试同一个请求不会变好, 需要人看。
+     */
+    @ExceptionHandler(ExecutionMismatchException.class)
+    public ResponseEntity<ApiError> handleExecutionMismatch(ExecutionMismatchException ex) {
+        log.warn("执行身份不匹配: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiError("EXECUTION_MISMATCH", ex.getMessage()));
     }
 
     /** @Valid 校验不过 —— 缺字段、超长、负数等 */

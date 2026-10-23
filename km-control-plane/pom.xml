@@ -22,7 +22,17 @@
     <description>K_middleware Java 控制面 — MCP 工具网关 / 任务状态事实源 / 审计</description>
 
     <modules>
-        <!-- Phase1 只要这两个。等真需要了再拆 km-gateway / km-task-service / km-common。 -->
+        <!--
+          审计信封和投递器。排在最前面只是可读性考虑 —— Maven 的 reactor
+          自己会按依赖关系排序, 不靠书写顺序。
+
+          为什么现在才拆: 原计划 (见下面注释的原文) 是"等真需要了再拆",
+          而"真需要"的时刻到了 —— km-mcp-server 也要发审计事件, 信封如果
+          留在 km-task-service 里, 网关就得反向依赖任务服务。
+        -->
+        <module>km-audit-core</module>
+
+        <!-- Phase1: 存量服务 mock + 把它包成 MCP 工具的门户 -->
         <module>km-mock-order-service</module>
         <module>km-mcp-server</module>
         <!-- Phase2: 任务生命周期管理, 状态机的事实源 -->
@@ -45,6 +55,22 @@
           以各种奇怪的方式失败。
         -->
         <mybatis-plus.version>3.5.17</mybatis-plus.version>
+
+        <!--
+          ★ 用【原生】rocketmq-client, 不用 rocketmq-spring-boot-starter ★
+
+          查过 starter 2.3.5 的父 pom: 它的 spring.boot.version 是 2.7.18,
+          也就是按 Boot 2.7 编的。本项目跑 Boot 4.0.8 (Spring Framework 7),
+          中间隔着 javax.* -> jakarta.* 那次改名, 直接拿过来用会以各种
+          看不懂的方式炸 —— 和当初 mybatis boot3/boot4 starter 是同一类坑。
+
+          原生 client 是纯 Java 库, 不依赖 Spring 的任何自动配置,
+          版本对 Boot 无感。代价是收发要自己装配 (见 audit/AuditPublisher)。
+          对控制面来说这反而是好事: 发送重试、线程模型、关停顺序都能自己控。
+
+          版本选 5.3.x 是同 broker (5.3.1) 保持同一条发布线。
+        -->
+        <rocketmq.version>5.3.4</rocketmq.version>
     </properties>
 
     <dependencyManagement>
@@ -66,6 +92,13 @@
                 <groupId>com.baomidou</groupId>
                 <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
                 <version>${mybatis-plus.version}</version>
+            </dependency>
+
+            <!-- RocketMQ 原生客户端, 理由见上面 properties 里的长注释 -->
+            <dependency>
+                <groupId>org.apache.rocketmq</groupId>
+                <artifactId>rocketmq-client</artifactId>
+                <version>${rocketmq.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

@@ -53,6 +53,20 @@
             <artifactId>spring-boot-starter-restclient</artifactId>
         </dependency>
 
+        <!--
+          审计信封 + 投递器。网关是四层里【第二层】采集点
+          (MCP_GATEWAY / LEGACY_SERVICE), 往同一个 KM_AUDIT topic 发。
+
+          注意它带来的是 rocketmq-client, 也就是网关从此【自己直连 broker】,
+          不再经过 km-task-service 转发 —— 网关是 Java, 直连没有障碍
+          (Python 那边才必须走 HTTP, 理由见 km-local-dev-env-traps)。
+        -->
+        <dependency>
+            <groupId>com.km</groupId>
+            <artifactId>km-audit-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
