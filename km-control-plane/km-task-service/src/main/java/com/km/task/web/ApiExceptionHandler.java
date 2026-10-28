@@ -2,6 +2,8 @@ package com.km.task.web;
 
 import com.km.task.error.ExecutionMismatchException;
 import com.km.task.error.IllegalTaskTransitionException;
+import com.km.task.error.MaxRetryExceededException;
+import com.km.task.error.RetryNotAllowedException;
 import com.km.task.error.TaskNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,6 +65,34 @@ public class ApiExceptionHandler {
         log.warn("执行身份不匹配: {}", ex.getMessage());
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(new ApiError("EXECUTION_MISMATCH", ex.getMessage()));
+    }
+
+    /**
+     * 重试请求被拒 (任务不在 FAILED / 还有执行未闭链 / 并发冲突)。
+     *
+     * <p>409 而不是 400: 请求本身没问题, 是任务当前状态不允许重试。
+     * 记 WARN —— 和状态流转被拒同一个理由, 它是"控制面动作与事实不符"的
+     * 直接线索。
+     */
+    @ExceptionHandler(RetryNotAllowedException.class)
+    public ResponseEntity<ApiError> handleRetryNotAllowed(RetryNotAllowedException ex) {
+        log.warn("重试被拒: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiError("RETRY_NOT_ALLOWED", ex.getMessage()));
+    }
+
+    /**
+     * 重试次数用尽。
+     *
+     * <p>同样是 409, 但<b>只记 INFO</b>: 这是配置好的边界被触碰, 不是异常,
+     * 也不是调用方的逻辑错误 —— 如果在这里刷 WARN, 一个卡在失败循环里的
+     * 任务会把日志刷满, 反而遮住真正需要看的那条。
+     */
+    @ExceptionHandler(MaxRetryExceededException.class)
+    public ResponseEntity<ApiError> handleMaxRetryExceeded(MaxRetryExceededException ex) {
+        log.info("重试次数用尽: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiError("MAX_RETRY_EXCEEDED", ex.getMessage()));
     }
 
     /** @Valid 校验不过 —— 缺字段、超长、负数等 */

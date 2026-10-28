@@ -48,6 +48,15 @@ public final class AuditHeaders {
     /** 触发者 (用户 ID / Agent ID)。对应 {@code audit_log.actor}。 */
     public static final String ACTOR = "X-KM-Actor";
 
+    /**
+     * 审计提交入口的内部认证 token。
+     *
+     * <p>它和上面四个头不是一类东西: 那四个是<b>业务身份</b> (回答"这是谁的事"),
+     * 这一个回答的是"<b>你是不是有权写审计</b>"。前者可以缺, 后者缺了就该被拒
+     * —— 一份谁都能往里灌数据的审计, 出事之后是不能拿来当证据的。
+     */
+    public static final String INGEST_TOKEN = "X-KM-Audit-Token";
+
     private AuditHeaders() {
     }
 }

@@ -5,6 +5,8 @@ import com.km.audit.AuditEventType;
 import com.km.audit.AuditLayer;
 import com.km.audit.AuditProperties;
 import com.km.audit.AuditPublisher;
+import com.km.task.audit.AttemptRef;
+import com.km.task.audit.AuditIngestProperties;
 import com.km.task.audit.AuditIngestService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -50,8 +52,17 @@ class AuditControllerTest {
     @BeforeEach
     void setUp() {
         publisher = new RecordingPublisher();
+        // 这里只关心 HTTP 边界, 所以身份核对给一个"只有一个已知 trace"的
+        // 最小假实现: trace-1 核实通过, 其它 trace 走 WARN 默认放行。
+        // 身份规则的完整矩阵在 AuditIngestServiceTest 里。
+        AuditIngestService service = new AuditIngestService(
+                publisher,
+                traceId -> "trace-1".equals(traceId)
+                        ? new AttemptRef("task-1", "trace-1", null)
+                        : null,
+                new AuditIngestProperties());
         mvc = MockMvcBuilders
-                .standaloneSetup(new AuditController(new AuditIngestService(publisher)))
+                .standaloneSetup(new AuditController(service))
                 .build();
     }
 
@@ -74,7 +85,12 @@ class AuditControllerTest {
                                 """))
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.accepted").value(2))
-                .andExpect(jsonPath("$.received").value(2));
+                .andExpect(jsonPath("$.received").value(2))
+                .andExpect(jsonPath("$.rejected").value(0))
+                // trace-2 在假核对表里查无 -> WARN 模式收下, 标记为未核实。
+                // 这个字段就是给 Python / 运维看"身份没对上"的入口。
+                .andExpect(jsonPath("$.unverified").value(1))
+                .andExpect(jsonPath("$.late").value(0));
 
         assertEquals(2, publisher.all().size());
     }

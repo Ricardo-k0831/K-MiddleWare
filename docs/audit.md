@@ -117,10 +117,11 @@ broker，实际上不行：Windows 上没有可用的 Python RocketMQ 客户端�
 跨任务的关联一律用 `session_id`，**不要用 trace_id 串**。一个 `task_id` 也可以横向
 跨多次重试（每次一个新 trace_id）。只留一个 ID，另一个维度就查不了了。
 
-> 当前实现还是 1:1，因为重试还没做：`create()` 同时创建了任务和它的第一次执行。
-> 这是"第一次执行"的生成点，不是"任务永久拥有一个 trace"。重试落地时，生成点
-> 要从 `create()` 移到"开始一次执行"的地方，`agent_task.trace_id` 的语义固定为
-> **最近一次执行**的 trace。
+> 2026-10-28 手动重试落地后，这个 1:N 是真的了：`create()` 生成第一次执行的
+> trace，`retry()` 每调用一次生成一条新链并插入一行新的 `agent_task_attempt`。
+> `agent_task.trace_id` 的语义固定为**最近一次执行**的 trace（滚动指针），
+> 权威来源是 `agent_task_attempt`。旧链不会失效于"时间"，而失效于
+> **任务表指针已经滚走**——拿旧 trace 进 `/chat` 或 PATCH 上报都会 409。
 
 两者都作为 RocketMQ 的消息 key 写入（空格分隔），所以按任一维度都能在控制台查到消息。
 
@@ -235,10 +236,12 @@ Spring AI 的自动配置建了一个默认 provider，上面裹着 `@Conditiona
 作用域要**恰好**包住一次 `ainvoke`（`main.py` 里的 `with task_identity(...)`）。
 包大了、或者忘了还原，症状同样是"任务 B 被记到任务 A 名下"。
 
-**身份是"携带"的，不是"生成"的。** `traceId` 的唯一生成点是
-`TaskService.create()`——准确说，是**任务第一次执行**的生成点（重试会另生成一个，
-见第二节）。`POST /api/tasks` 的响应里就有 `traceId` / `tenantId` / `userId`，
-调用方原样转交给 `/chat` 即可。
+**身份是"携带"的，不是"生成"的。** `traceId` 只在 Java 侧生成，而且只在
+"开始一次执行"时生成：`TaskService.create()`（第一次执行）和
+`TaskService.retry()`（第 N 次执行）。`POST /api/tasks` 与
+`POST /api/tasks/{id}/retry` 的响应里都有 `traceId` / `tenantId` / `userId`，
+调用方原样转交给 `/chat` 即可。Python 侧拿到的永远是"这次该用哪条链"，
+不参与决定。
 
 Python 侧**不兜底生成**一个 `traceId`。生成的话会得到两个：任务表里是 Java 的，
 审计表里是 Python 的，同一个任务被劈成两条对不上的链路。**缺了就拒绝**——任务
@@ -554,8 +557,10 @@ Python 侧最重要的一条是 `test_同一个client连着发两次_两次用�
 多一跳少一跳没区别，而少一个连数据库的进程是实打实的好处。
 
 ```
-POST :8083/api/audit/events      body: [AuditEventRequest, ...]
-→ 202 {"accepted": n, "received": m}
+POST :8083/api/audit/events      body:   [AuditEventRequest, ...]
+                                 header: X-KM-Audit-Token: <共享密钥>
+→ 202 {"accepted": n, "received": m, "rejected": r, "unverified": u, "late": l}
+→ 401 认证失败（token 缺失或不匹配）
 ```
 
 **批量，不是单条。** 一次 LLM 调用只产生一两条事件，但一个任务几十条，每条
@@ -582,8 +587,8 @@ bug**。两道都不重复，去掉任何一道，另一个类别的错都会静
 > "显式传 null 的 layer" 的用例钉住了——字段缺失可能死在反序列化那一步，只有
 > 显式 null 才能证明元素级校验真的生效。
 
-**认证还是空的。** 任何人现在都能往这里发事件，包括编造 `task_id`。这和"审计
-要可信"直接冲突，没做就是没做，见第十一节。
+**认证和身份核对是后来补的**（见下面第 7 条）。这里只强调一点：这两件事管的
+不是同一个问题——token 管"你能不能写"，attempt 核对管"你写的这条是否自洽"。
 
 ### 2. Python 侧的生产者（`app/audit.py`）
 
@@ -619,6 +624,21 @@ Jackson 会 400 掉整批。
 用它的 `trace_id` 盖章。原因是溯源信息必须不可变：`agent_task.trace_id` 是
 "最近一次执行"的滚动值，重试一开始就会变，从那里取 trace 会把第一遍执行
 的在途事件盖成第二遍的——单看每一行都正常，只有按 trace 拼链路才发现拼不上。
+
+**重试也发一条 TASK_LIFECYCLE，盖的是新链的 trace。** `request_body` 沿用
+同一形状 `{"from":"FAILED","to":"PENDING","source":"JAVA_GATEWAY","detail":{...}}`，
+`detail` 里额外有 `attemptNo` / `traceId` / `previousTraceId` / `reason`。
+于是审计里能看到两条完整的链，且能回答"第二遍是从第一遍的哪条链接过来的"：
+
+```
+trace 364a280c: 创建 -> THINKING -> FAILED
+trace 488db1d0: FAILED -> PENDING (attemptNo=2, previousTraceId=364a280c)
+                -> THINKING -> COMPLETED
+```
+
+`previousTraceId` 是**冗余**的（`agent_task_attempt` 里本来就能按 attempt_no
+推出前后关系），冗余在这里是值得的：审计是旁路，查一条链的来历不该再要求
+联表。注意它只用于**链与链之间**的父子关系，跨任务仍然只用 `task_id`。
 
 ### ★ 4. `occurred_at` 的定义——这条是端到端跑出来才发现的 ★
 
@@ -706,14 +726,17 @@ cd km-control-plane && mvn install
 #                      CallStatusTest                       8
 #                      McpToolAuditTest                    10
 #                      OrderServiceClientAuditTest          8
-# km-task-service      TaskStatusMachineTest                8
-#                      AuditIngestServiceTest              14
+# km-task-service      TaskStatusMachineTest               11   (含重试边)
+#                      AuditIngestServiceTest              24   (映射 + 身份核对矩阵)
+#                      CachedAttemptLookupTest              6   (缓存的三种结果)
+#                      GuardedAttemptLookupTest             5   (500ms 截止 + 熔断)
+#                      AuditIngestAuthFilterTest            5   (认证边界)
 #                      AuditControllerTest                 10   (本项目第一个 web 测试)
-#                      TaskServiceTest                      8   ← 新增 (执行身份 + 溯源)
-#                      ReportStatusRequestTest              3   ← 新增 (traceId 必填契约)
+#                      TaskServiceTest                     14   (执行身份 + 溯源 + 重试)
+#                      ReportStatusRequestTest              3   (traceId 必填契约)
 
 cd km-agent-runtime && uv run pytest
-# 95 passed, 3 skipped   (跳过的是 3 条 MCP 握手用例: 8081 没起)
+# 103 passed, 3 skipped   (跳过的是 3 条 MCP 握手用例: 8081 没起)
 ```
 
 `AuditControllerTest` 是**本项目第一个 web 测试**。它验的不是业务，是
@@ -726,14 +749,145 @@ Python 侧最值得留着的一条是
 `test_事件的occurredAt是开始时刻而不是结束时刻`——它守的是上面第 4 条那个
 只靠并排比对才能发现的错。
 
+### 7. 审计摄入的信任边界（2026-10-26）
+
+第十一节的第 1 条和第 4 条（入口不校验身份）在这里一起收口。分两层，因为
+它们回答的是两个不同的问题：
+
+| 问题 | 机制 | 失败时 |
+|------|------|--------|
+| 你有没有权写审计 | `X-KM-Audit-Token` 共享密钥 | 401，请求进不了控制器 |
+| 你写的这条是否自洽 | 拿 `traceId` 查 `agent_task_attempt` | 矛盾拒收 / 未知按模式处理 |
+
+**为什么 token 不做成按调用方区分的凭据。** 现在只有 Python 运行时一个
+提交方，按调用方发 token 是在给一个还不存在的问题写代码。布局不用变：将来
+MCP 网关也要直报时，多配一个 token 即可。
+
+**为什么比较用 `MessageDigest.isEqual`。** `String.equals` 遇到第一个不同的
+字节就返回，比较耗时因此与"猜对了几个字符"相关。`isEqual` 对等长数组做定长
+比较。长度不同仍会提前返回，但不引入依赖、比 `equals` 强，对这个威胁模型够了。
+
+**空 token = 明确关闭，不是静默关闭。** 配空时过滤器放行，但启动日志里打一条
+WARN。默认值 `dev-audit-token-change-me` 写在 YAML 里（所以它不是秘密），
+用在默认值上时再单独 WARN 一次——生产必须用 `KM_AUDIT_INGEST_TOKEN` 覆盖。
+
+**身份核对复用 `agent_task_attempt`，不新建表。** 这张表已经是"一次执行"的
+权威记录：(task_id, attempt_no) 唯一、trace_id 全局唯一、`ended_at IS NULL`
+表示还在跑。审计要核对的正是这些，再造一张表只会多一份需要同步的真相。
+
+规则矩阵：
+
+| 情况 | WARN（默认） | STRICT |
+|------|--------------|--------|
+| 没有 traceId | 不查表，放行 | 不查表，放行 |
+| trace 查到，taskId 一致 | 放行，verified | 放行，verified |
+| trace 查到，taskId 缺失 | 用 attempt 上的 taskId 补齐 | 同左 |
+| trace 查到，taskId 矛盾 | **拒收** | **拒收** |
+| trace 查无 | 放行，计 `unverified` | 拒收 |
+| 查询失败 / 超时（库故障） | 放行，计 `unverified` | **放行**，计 `unverified` |
+
+最后一行是刻意的：**数据库故障不等于"这个 trace 不存在"**。审计入口不该额外
+引入一次"必须查库成功才能记录"的同步依赖——故障期间恰是最需要审计的时候。
+所以 `AttemptLookup` 的契约把"返回 null（查无）"和"抛异常（查不动）"分开，
+缓存层也保证**异常不进缓存**。
+
+### ★ 实测出来的 30 秒：降级必须带硬截止时间 ★
+
+第一版直接在请求线程里查库，规则全对，但把 MySQL 停掉之后实测：
+
+```
+POST /api/audit/events  ->  202 {"accepted":1,"unverified":1}   time=30.024930s
+```
+
+卡满的是 Hikari 的 `connectionTimeout`（默认 30 秒）。这 30 秒让降级失去意义：
+
+- Python 的审计上报超时是 **2 秒**，客户端早就丢掉整批了，服务端再"收下"没用；
+- 每个事件占着一个 Tomcat 线程，数据库一挂，审计入口会反过来拖垮任务服务；
+- STRICT 模式更糟：本该"查不动就放行"，实际是"先卡 30 秒再说"。
+
+所以加了 `GuardedAttemptLookup` 这一层装饰器：
+
+| 机制 | 参数 | 作用 |
+|------|------|------|
+| 硬截止 | 500ms | 查库扔进小线程池，当前线程最多等 500ms |
+| 熔断 | 失败后 5s | 冷却期内直接抛，不再提交——一批 50 条不会变成 50 × 500ms |
+| 有界池 | 2 线程 / 32 队列 | 满了直接拒绝并熔断，宁可少核对也不让积压吃内存 |
+
+超时/失败抛 `AttemptLookupUnavailableException`，`AuditIngestService` 收到后
+按"未核实"放行。冷却结束后的第一次查询就是探测，没有额外的"半开"状态。
+
+同一套停机场景复测：
+
+```
+MySQL 停机后第一条:  202 {"accepted":1,"unverified":1}   time=0.513s
+熔断中的第二条:      202 {"accepted":1,"unverified":1}   time=0.005s
+MySQL 拉起后新任务:  202 {"accepted":1,"unverified":0}   verified
+```
+
+> 500ms 的来历：Python 超时 2 秒的四分之一，留足回包余量；正常查库是毫秒级
+> （还有缓存兜着），只有真出问题时才会用满。后台那次 JDBC 调用仍会走完 30 秒，
+> 但已经没人等它了——线程是 daemon，不会拖住 JVM 关闭。
+
+### 端到端实测（2026-10-26，docker 起来后）
+
+```
+无 token / 错 token                -> 401，投递 0 条
+已验证 (task1 + trace1)            -> 202 accepted=1 unverified=0
+缺 taskId                          -> 202 accepted=1，库里 task_id 已补齐
+taskId 与 trace 矛盾               -> 202 accepted=0 rejected=1，库里无此行
+未知 trace (WARN)                  -> 202 accepted=1 unverified=1
+未知 trace (STRICT)                -> 202 accepted=0 rejected=1
+闭链后迟到事件                     -> 202 accepted=1 late=1，仍未丢
+```
+
+`audit_log` 里核对过：`ev-verified` / `ev-fill` / `ev-unknown` / `ev-late`
+都在，`ev-mismatch` 不在；`ev-fill` 那一行的 `agent_task_id` 就是 attempt 上的
+任务 ID。`agent_task_attempt` 中任务 1 是 `RUNNING`、任务 2 闭链为 `COMPLETED`。
+
+**缓存很小，而且是有意的。** 一次执行的几十条事件共用一个 traceId，缓存命中率
+接近 100%；不缓存等于让审计旁路按"每条事件一次查询"的速率压库。正缓存 60 秒、
+负缓存 5 秒（让"审计先到、attempt 后建"能自己恢复）、上限 1 万条（满了先清过期
+再淘汰任意一条，淘汰谁都不影响正确性）。TTL 用 `System.nanoTime()` 计算，不受
+系统时钟回拨影响。
+
+**迟到事件不拒收。** 事件的发生时刻晚于 attempt 的 `ended_at` 时，说明执行已经
+闭链、还有事件在排队。它可能只是慢，不是假——丢掉等于篡改历史；所以只计入
+`late` 并打 INFO，不改事件内容（`audit_log` 没有对应的列，改了记录就不再忠于
+原始观察）。
+
+**计数可以互相验算**：`accepted + rejected == received`，且 `unverified` /
+`late` 都是 `accepted` 的子集。Python 侧把 `rejected` 一起打进丢事件的日志，
+把 `unverified` 单独 WARN 一次——否则"身份没对上"只存在于 Java 的计数里，
+Python 这边看起来一切正常。
+
+配置两端各一份，必须一致：
+
+```yaml
+# km-task-service/application.yml
+km.audit.ingest.token: ${KM_AUDIT_INGEST_TOKEN:dev-audit-token-change-me}
+km.audit.ingest.identity-check: ${KM_AUDIT_IDENTITY_CHECK:warn}
+```
+
+```dotenv
+# 仓库根目录 .env（Python 读取）
+AUDIT_INGEST_TOKEN=dev-audit-token-change-me
+```
+
 ---
 
 ## 十一、还没做的部分
 
-1. **审计接口没有认证。** 现在谁都能 `POST /api/audit/events`，包括编造
-   `task_id`、伪造 `actor`。这和"审计记录可信"是直接冲突的——一份能被任何
-   本地进程往里灌假数据的审计，出了事是不能拿来当证据的。要的是服务间认证
-   （内部 token / mTLS），不是给外部用的 API key。
+1. ~~**审计接口没有认证。**~~ 2026-10-26 已补：共享 token + 按 attempt 核对
+   身份（第十节第 7 条）。但它是"够用"而不是"完备"，剩下的三件事要记着：
+
+   - **token 是共享的。** 一份泄露 = 所有提交方都能写。要做到"按调用方追责"，
+     得给每个提交方发独立凭据，或者上 mTLS——现在只有 Python 一个提交方，
+     还为时过早。
+   - **控制面的其它接口仍然没有鉴权。** `/api/tasks` 谁都能建任务、改状态；
+     审计入口只是先收口了这一处。
+   - **`unverified` / `late` 没有接指标系统。** 它们现在只出现在 202 响应和
+     日志里，没有趋势、没有告警。要回答"这周身份核对失败率是不是涨了"，
+     还得先把 Micrometer 接上。
 
 2. **`tool_invocation` 表已经加了 `trace_id` 列，但没有任何地方写它。**
    它和 `audit_log` 是两张表：前者是"工具调用"这张业务视图，后者是统一审计
@@ -755,20 +909,29 @@ Python 侧最值得留着的一条是
    没有依据去定那个数：得先有真实量级的分布，才谈得上"哪一层的哪些事件可以
    丢"。`LLM_CALL` 大概是最不能丢的——它贵，而且 token 数只有这一层有。
 
-6. **重试没有实现，「任务 : 调用链 = 1:N」现在实际是 1:1。** `agent_task` 上有
-   `retry_count` / `max_retry` 两列，但没有任何代码读它们。
+6. **重试只做了手动 API，「任务 : 调用链 = 1:N」结构上通了，自动重试还没有。**
+   `POST /api/tasks/{id}/retry` 在一条事务里完成：CAS 更新任务（FAILED ->
+   PENDING、换新 trace、`retry_count+1`、清掉上一轮的 `finished_at` /
+   `error_msg` / `result`）、插入 `attempt_no+1` 的 RUNNING 记录、写事件、
+   发审计。失败时 `retry_count >= max_retry` 或任务不是 FAILED 都返回 409。
 
-   不过**支撑 1:N 的结构已经就位**：`agent_task_attempt` 是执行的权威记录，
-   建任务时和任务同一事务写入；状态上报必须带 `traceId`，Java 按它找到对应
-   attempt，用 attempt 上的 trace 给审计盖章；终态时闭链。真要做重试时，
-   剩下的是"开第二行 attempt"这件事本身——生成点从 `create()` 移到一个新的
-   `beginAttempt()`，其它三处（`/chat` 幂等、上报报文、审计取 trace）都不用
-   再改。**唯一还缺的是 `/chat` 目前只核对任务上的最新 trace，没有核对
-   "该 trace 的 attempt 是否还开着"**——重试落地时需要任务服务再开一个查询
-   接口，现在 1:1 用任务字段足够。
+   自动重试（定时扫描 / 退避 / 失败后自动决定是否再试）**没有做**，因为它需要
+   Java → Python 的调度通道，而手动 API 是它的前置：先把"开新 attempt"做成
+   一个原子动作，以后无论是定时器还是 MQ 消费者来调，都只是多一个调用方。
+
+   `/chat` 入口现在核对的仍是 `agent_task.traceId`（当前执行的指针），这已经
+   够了：重试和换指针在同一事务里，指针指向的 attempt 一定是开着的那条。另外
+   入口加了一条**终态拒绝**——trace 对得上但任务已经 COMPLETED / FAILED /
+   CANCELLED 时直接 409，并提示去调 `/retry`。没有这条的话，Agent 会白跑一整轮，
+   而 Java 会拒掉它产生的每一条上报和审计。
 
 7. **「会话」只有数据库维度，没有运行时维度。** `/chat` 里 `thread_id = task_id`，
    所以 LangGraph 的记忆按**任务**隔离：同一会话里的第二个任务看不见第一个任务的
    上下文。要做会话级记忆，得把 `thread_id` 换成 `session_id`，用 LangGraph 的
    `checkpoint_ns` 区分任务。当前 `session_id` 只是一个能被查询的标签。
+
+8. **审计摄入的可用性参数还是常量。** 500ms 截止、5 秒熔断、2 线程 / 32 队列
+   都写在 `GuardedAttemptLookup` 里。现在够用，但这几个值取决于机器和流量，
+   压测之后应当外置到 `km.audit.ingest`。另外正缓存 60 秒意味着**迟到识别最
+   多会晚一分钟**——迟到事件本身不会丢，只是 `late` 计数晚一点才准。
 

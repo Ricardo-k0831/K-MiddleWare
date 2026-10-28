@@ -22,7 +22,8 @@ import java.time.LocalDateTime;
  * 所以"执行"必须是一等公民, 有自己的行:
  *
  * <ul>
- *   <li>一个任务可以有多次执行 (现在重试没实现, 所以恒为 1 次)</li>
+ *   <li>一个任务可以有多次执行: 首次由 {@code create()} 建, 每次重试由
+ *       {@code retry()} 建下一代 (attempt_no 递增)</li>
  *   <li>每次执行有且只有一个 {@code trace_id}, 建行时确定, 之后不再改</li>
  *   <li>{@code ended_at} 非空 = 这次执行已闭链, 不再接受状态上报</li>
  * </ul>

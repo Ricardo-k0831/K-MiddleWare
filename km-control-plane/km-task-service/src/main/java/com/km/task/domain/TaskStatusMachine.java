@@ -24,6 +24,14 @@ import java.util.Set;
  *   <li><b>同态上报幂等</b> —— 见 {@link #isNoop}, 由调用方处理成
  *       "返回 200 但不写事件表"</li>
  * </ul>
+ *
+ * <h2>★ 重试是唯一能离开终态的边, 而且它不在这张表里 ★</h2>
+ *
+ * <p>{@code FAILED -> PENDING} 由 {@link #isRetryAllowed} <b>单独</b>判定,
+ * 不放进 {@link #ALLOWED}。原因: {@code ALLOWED} 是"上报能走的边", 而
+ * Python 运行时绝不能自己把 FAILED 翻回 PENDING —— 它只能上报"我失败了",
+ * 要不要再试一次是控制面的决定。两条规则放在两个方法里, "上报不能离开
+ * 终态"这个不变量就仍然由 36 组合的穷举测试锁着。
  */
 public final class TaskStatusMachine {
 
@@ -88,5 +96,32 @@ public final class TaskStatusMachine {
      */
     public static boolean isNoop(TaskStatus from, TaskStatus to) {
         return from != null && from == to;
+    }
+
+    /**
+     * 重试这条边是否成立: <b>只有 {@code FAILED -> PENDING}</b>。
+     *
+     * <h3>为什么单独一个方法</h3>
+     *
+     * <p>见类注释: 它不能被 {@link #isAllowed} 认出来, 否则一条伪造的
+     * PATCH 就能把终态任务"重试"回 PENDING —— 那等于给 Python 开了后门。
+     * 只有 {@code TaskService.retry()} 这个控制面入口会调用它。
+     *
+     * <h3>为什么只允许 FAILED</h3>
+     *
+     * <ul>
+     *   <li><b>COMPLETED</b>: 已经成功, "再试一次"没有业务含义。真要重跑,
+     *       那是<b>新建任务</b> (新的 task_id、新的意图上下文), 不是重试 ——
+     *       重试的前提是"同一个任务、同一个目标、上次没做成"</li>
+     *   <li><b>CANCELLED</b>: 用户/运维主动停下的。自动或半自动地把它拉回
+     *       PENDING 会违背那次取消的意图; 要恢复也应当是一条显式的
+     *       "恢复"操作, 而不是复用重试</li>
+     * </ul>
+     *
+     * <p>返回 {@code false} 不代表"非法状态上报" (那条路径根本不会问到这里),
+     * 而是"这个任务现在不该被重试"。
+     */
+    public static boolean isRetryAllowed(TaskStatus from, TaskStatus to) {
+        return from == TaskStatus.FAILED && to == TaskStatus.PENDING;
     }
 }

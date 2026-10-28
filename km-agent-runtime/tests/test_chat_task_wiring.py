@@ -187,6 +187,7 @@ def wired(monkeypatch):
             trace_id: str | None = None,
             tenant_id: str | None = None,
             actor: str | None = None,
+            token: str | None = None,
             timeout: float = 2.0,
         ) -> None:
             super().__init__(
@@ -195,6 +196,7 @@ def wired(monkeypatch):
                 trace_id=trace_id,
                 tenant_id=tenant_id,
                 actor=actor,
+                token=token,
                 timeout=timeout,
                 client=httpx.AsyncClient(transport=fake.transport()),
             )

@@ -14,6 +14,8 @@ import com.km.task.domain.TaskStatus;
 import com.km.task.domain.TaskStatusMachine;
 import com.km.task.error.ExecutionMismatchException;
 import com.km.task.error.IllegalTaskTransitionException;
+import com.km.task.error.MaxRetryExceededException;
+import com.km.task.error.RetryNotAllowedException;
 import com.km.task.error.TaskNotFoundException;
 import com.km.task.mapper.AgentTaskAttemptMapper;
 import com.km.task.mapper.AgentTaskEventMapper;
@@ -273,6 +275,191 @@ public class TaskService {
         return updated;
     }
 
+    // ------------------------------------------------------------------
+    //  重试 —— 开始下一次执行
+    // ------------------------------------------------------------------
+
+    /**
+     * 人工重试: 把一次 <b>FAILED</b> 的任务拉回 PENDING, 并开启它的下一代执行。
+     *
+     * <h3>★ 重试不是一个状态, 是"换一条链重新排队" ★</h3>
+     *
+     * <p>不引入 {@code RETRYING} 状态: 新 attempt 的创建、任务回到 PENDING、
+     * 事件落表都在<b>同一个事务</b>里完成, 外部看不到任何中间态。多一个
+     * 状态, 就要多定义它能去哪、超时了怎么办、谁负责推进 —— 而它存在的
+     * 那几毫秒没有任何人会观察到。
+     *
+     * <h3>★ 为什么是新 trace, 不是复用旧 trace ★</h3>
+     *
+     * <p>一条 trace 的边界是<b>一次执行</b>。复用旧 trace 会把两遍执行
+     * 混成一条链: 分不清某个工具调用属于哪一遍, token/耗时被重复累加,
+     * 而且上一遍已经闭链的 attempt 会让新上报在 (1.5) 被当成"迟到的旧执行"
+     * 拒掉。所以重试必须生成新 trace —— 这也是 {@link #newTraceId()} 里
+     * "任务 : 调用链 = 1:N"那句话真正兑现的地方。
+     *
+     * <p>新旧两条链靠 {@code taskId} 串起来 (不是靠 trace), 并且在事件和
+     * 审计的 detail 里显式写下 {@code previousTraceId} —— 这样即使不查
+     * {@code agent_task_attempt}, 也能从审计里看出"这条链是从哪条链接过来的"。
+     *
+     * <h3>★ 一次事务里做七件事 ★</h3>
+     *
+     * <ol>
+     *   <li>状态机校验: 只有 FAILED 能重试 (见 {@link TaskStatusMachine#isRetryAllowed})</li>
+     *   <li>次数校验: {@code retry_count < max_retry}</li>
+     *   <li>不变量校验: 同一任务下不能有未闭链的 attempt</li>
+     *   <li>CAS 更新任务: status / trace_id / retry_count, 并清掉上一轮的
+     *       finished_at / error_msg / result</li>
+     *   <li>插入下一代 attempt (attempt_no = retry_count + 2, RUNNING)</li>
+     *   <li>写 {@code FAILED -> PENDING} 事件</li>
+     *   <li>发 TASK_LIFECYCLE 审计 (事务提交后才真正投 MQ)</li>
+     * </ol>
+     *
+     * <p><b>为什么 CAS 要带上 {@code retry_count}</b>: 两个重试请求同时到达时,
+     * 它们读到的都是 FAILED+retry_count=0。只比较 status 的话, 第一个请求
+     * 把 status 改成 PENDING 后第二个会失败; 但若两次都恰好读到 FAILED
+     * (可重复读快照), 只比较 status 仍可能双写。把 retry_count 也作为
+     * CAS 条件, 第二次更新必然影响 0 行。输掉的一方拿到 409, 而不是
+     * 一条 attempt_no 冲突的 500。
+     *
+     * <p><b>为什么清 error_msg / result</b>: 这两列描述的是"任务当前状态"。
+     * 任务回到 PENDING 后还挂着上一轮的失败原因, 会让查询方以为这次也失败了。
+     * 上一轮的结果和错误并没有丢 —— 它们在事件表和审计里, 那才是历史,
+     * 而任务表只记现在。
+     *
+     * @param reason 可选的重试原因, 写进事件和审计; 便于事后回答"谁为什么又跑了一遍"
+     * @return 更新后的任务 (含新的 traceId)
+     */
+    @Transactional
+    public AgentTask retry(String agentTaskId, String reason) {
+        AgentTask task = requireTask(agentTaskId);
+        TaskStatus from = parseStatus(task);
+
+        // (1) 只有 FAILED 能重试。COMPLETED / CANCELLED / 非终态一律拒绝 ——
+        //     理由见 TaskStatusMachine.isRetryAllowed。
+        if (!TaskStatusMachine.isRetryAllowed(from, TaskStatus.PENDING)) {
+            throw new RetryNotAllowedException(agentTaskId,
+                    "只有 FAILED 的任务可以重试, 当前是 " + from);
+        }
+
+        int retryCount = task.getRetryCount() == null ? 0 : task.getRetryCount();
+        int maxRetry = task.getMaxRetry() == null ? 0 : task.getMaxRetry();
+
+        // (2) 次数边界。>= 而不是 >: retry_count 是"已经重试过几次"。
+        if (retryCount >= maxRetry) {
+            throw new MaxRetryExceededException(agentTaskId, retryCount, maxRetry);
+        }
+
+        // (3) 任务已 FAILED, 却还有执行没闭链 —— 正常流程不会出现
+        //     (终态上报会在同一事务里闭链)。这属于数据不一致, 宁可拒绝,
+        //     也不能在一条可能还在写上报的链旁边再开一条。
+        if (hasRunningAttempt(agentTaskId)) {
+            throw new RetryNotAllowedException(agentTaskId,
+                    "任务已是 FAILED, 但仍有一次执行未闭链 (数据不一致, 请先排查)");
+        }
+
+        // 旧 trace 要在 UPDATE 之前取: 更新之后 task 对象虽然没变, 但语义上
+        // 它已经是"上一代"了。显式存下来, 后面写进事件和审计。
+        String previousTraceId = task.getTraceId();
+        // 空串和全空白不该进库: 将来按 detail.reason 分组时, "" / "  " / null
+        // 会变成三个不同的组, 而它们表达的是同一件事 —— 没说理由。
+        String trimmedReason = isBlank(reason) ? null : reason.trim();
+        String newTraceId = newTraceId();
+        // 执行次数 = 1 (首次) + 已重试次数; 所以下一代的序号是 retryCount + 2。
+        int nextAttemptNo = retryCount + 2;
+        LocalDateTime now = LocalDateTime.now();
+
+        // (4) CAS: status 和 retry_count 一起作为前置条件。
+        //     finished_at / error_msg / result 显式 set null —— updateById 的
+        //     默认策略会跳过 null 字段, 那样上一轮的失败信息就永远清不掉了。
+        int affected = taskMapper.update(null, Wrappers.<AgentTask>lambdaUpdate()
+                .eq(AgentTask::getAgentTaskId, agentTaskId)
+                .eq(AgentTask::getStatus, from.name())
+                .eq(AgentTask::getRetryCount, retryCount)
+                .set(AgentTask::getStatus, TaskStatus.PENDING.name())
+                .set(AgentTask::getTraceId, newTraceId)
+                .set(AgentTask::getRetryCount, retryCount + 1)
+                .set(AgentTask::getUpdatedAt, now)
+                .set(AgentTask::getFinishedAt, null)
+                .set(AgentTask::getErrorMsg, null)
+                .set(AgentTask::getResult, null));
+
+        if (affected == 0) {
+            // 读到写之间有人抢先重试/改了状态。不是 bug, 是并发 —— 返回 409
+            // 让调用方重新读状态, 而不是在这里自己重试 (自动重试会把
+            // "用户连点两下"变成两个 attempt)。
+            log.warn("重试并发冲突 task={} retryCount={}", agentTaskId, retryCount);
+            throw new RetryNotAllowedException(agentTaskId,
+                    "并发冲突: 任务状态或重试次数在读取之后已被其他请求修改");
+        }
+
+        // (5) 下一代执行。和上面的 UPDATE 同一事务 —— 不存在"任务已回到
+        //     PENDING 但没有对应 attempt"的中间态, 否则审计里这条新链
+        //     就没有权威来源了。
+        AgentTaskAttempt attempt = new AgentTaskAttempt();
+        attempt.setAgentTaskId(agentTaskId);
+        attempt.setTraceId(newTraceId);
+        attempt.setAttemptNo(nextAttemptNo);
+        attempt.setStatus(AgentTaskAttempt.RUNNING);
+        attemptMapper.insert(attempt);
+
+        // (6) 事件: from 是 FAILED, to 是 PENDING, source 是 JAVA_GATEWAY。
+        //
+        //     ★ 为什么不是 SYSTEM_RETRY ★
+        //     这个接口是"人工/调用方显式发起"的一次重试; SYSTEM_RETRY 留给
+        //     将来的超时补偿/自动退避 —— 那时"谁触发的"才是系统。来源混用
+        //     的话, 事后统计"有多少任务是系统兜底救回来的"就查不出来了。
+        //     状态机那条边本身与 source 无关, 受控性来自"只有 retry() 会调
+        //     isRetryAllowed", 不来自枚举值。
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put("attemptNo", nextAttemptNo);
+        detail.put("traceId", newTraceId);
+        putIfPresent(detail, "previousTraceId", previousTraceId);
+        putIfPresent(detail, "reason", trimmedReason);
+        appendEvent(agentTaskId, from, TaskStatus.PENDING,
+                TaskEventSource.JAVA_GATEWAY, detail);
+
+        AgentTask updated = requireTask(agentTaskId);
+
+        // (7) 审计。trace 用【新】链: 这条事件标记新一次执行的开始。
+        //     上一遍的失败事件早已带着旧 trace 落库, 不需要在这里补记 ——
+        //     否则同一个事实会有两条, 按 trace 统计生命周期时重复计数。
+        //     previousTraceId 放在 requestBody.detail 里, 显式建立跨链关系。
+        audit.publish(AuditEvent.builder()
+                .taskId(agentTaskId)
+                .traceId(newTraceId)
+                .tenantId(updated.getTenantId())
+                .layer(AuditLayer.TASK_SERVICE)
+                .eventType(AuditEventType.TASK_LIFECYCLE)
+                // actor 仍是任务归属用户: 重试的是"他的任务"。
+                // 发起者在当前的接口里没有身份信息 (还没有鉴权), 不编造。
+                .actor(updated.getUserId())
+                .status(AuditEvent.OK)
+                .requestBody(transitionRequest(from, TaskStatus.PENDING,
+                        TaskEventSource.JAVA_GATEWAY, detail))
+                .responseBody(taskSnapshot(updated))
+                .build());
+
+        log.info("任务重试 task={} attemptNo={} newTrace={} previousTrace={} retryCount={}/{}",
+                agentTaskId, nextAttemptNo, newTraceId, previousTraceId,
+                retryCount + 1, maxRetry);
+        return updated;
+    }
+
+    /**
+     * 这个任务下是否有未闭链的执行。
+     *
+     * <p>不变量是"同一任务最多一条 {@code ended_at IS NULL}"。数据库没有
+     * 唯一约束能表达它 (MySQL 的部分索引不可用), 所以在写入前显式检查。
+     * 正常情况下重试时应当为 0: FAILED 的终态上报会闭链。
+     */
+    private boolean hasRunningAttempt(String agentTaskId) {
+        Long running = attemptMapper.selectCount(
+                Wrappers.<AgentTaskAttempt>lambdaQuery()
+                        .eq(AgentTaskAttempt::getAgentTaskId, agentTaskId)
+                        .isNull(AgentTaskAttempt::getEndedAt));
+        return running != null && running > 0;
+    }
+
     /**
      * 状态流转事件的 requestBody。
      *
@@ -412,11 +599,10 @@ public class TaskService {
      * (会话不是一条 trace: 一条 trace 的边界是【一次执行】。见
      * docs/audit.md 第二节。)
      *
-     * <p><b>现在实际上还是 1:1, 因为重试还没实现</b>: {@link #create} 同时
-     * 创建了任务和它的第一次执行, 所以两个 ID 一起生成。等重试落地, 这个
-     * 方法的调用点要从 create() 移到"开始一次执行"的地方, 并且
-     * {@code agent_task.trace_id} 的语义固定为【最近一次执行】的 trace ——
-     * 而不是任务的、也不是永久的。
+     * <p><b>调用点有两处, 对应"开始一次执行"的两个入口</b>:
+     * {@link #create} (第一次执行) 和 {@link #retry} (第 N 次执行)。
+     * {@code agent_task.trace_id} 的含义固定为【最近一次执行】的 trace ——
+     * 不是任务的、也不是永久的; 权威来源是 {@code agent_task_attempt}。
      */
     private static String newTraceId() {
         return UUID.randomUUID().toString().replace("-", "");

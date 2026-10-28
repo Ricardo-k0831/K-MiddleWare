@@ -51,8 +51,10 @@ def _run(handler, trace_id: str = TRACE_ID) -> None:
     asyncio.run(scenario())
 
 
-def _task_response(trace_id: str) -> httpx.Response:
-    return httpx.Response(200, json={"agentTaskId": TASK_ID, "traceId": trace_id})
+def _task_response(trace_id: str, status: str = "PENDING") -> httpx.Response:
+    return httpx.Response(
+        200, json={"agentTaskId": TASK_ID, "traceId": trace_id, "status": status}
+    )
 
 
 # ----------------------------------------------------------------------
@@ -128,3 +130,44 @@ def test_响应里没有traceId按不匹配处理() -> None:
         _run(lambda request: httpx.Response(200, json={"agentTaskId": TASK_ID}))
 
     assert caught.value.status_code == 409
+
+
+# ----------------------------------------------------------------------
+#  终态任务: trace 对得上, 也不能再跑
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["COMPLETED", "FAILED", "CANCELLED"])
+def test_终态任务不能再次进入chat(status: str) -> None:
+    """身份对 + 生命周期已结束 = 拒绝。
+
+    放行的后果不是"多跑一次"这么简单: Java 的状态机会拒绝这次运行产生的
+    每一条上报和审计, 而用户在 Python 这边看到的是一个完全正常的答案。
+    错误必须在这里、在花钱之前暴露。
+    """
+    with pytest.raises(HTTPException) as caught:
+        _run(lambda request: _task_response(TRACE_ID, status))
+
+    assert caught.value.status_code == 409
+    assert status in caught.value.detail
+    # 报错要指出下一步 —— 只说"不行"会让人去新建任务, 丢掉重试次数
+    assert "retry" in caught.value.detail
+    assert "新的 traceId" in caught.value.detail
+
+
+def test_非终态任务照常放行() -> None:
+    for status in ("PENDING", "THINKING", "TOOL_CALLING"):
+        _run(lambda request: _task_response(TRACE_ID, status))
+
+
+def test_重试后旧trace被拒() -> None:
+    """重试的本质是换一条链: 任务表指向新 trace, 旧的必须当场失效。
+
+    旧链的 attempt 已经闭链, 它剩下的任何在途请求都不该再进入 Agent ——
+    否则第二遍执行会和第一遍的尾巴并行, 两边都往同一个 taskId 写。
+    """
+    with pytest.raises(HTTPException) as caught:
+        _run(lambda request: _task_response("重试后的新trace"))
+
+    assert caught.value.status_code == 409
+    assert "执行身份不匹配" in caught.value.detail

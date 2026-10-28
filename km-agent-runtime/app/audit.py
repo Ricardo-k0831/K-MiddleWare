@@ -43,6 +43,21 @@ worker 每次醒来把队列里现成的取走, 一趟发完。
 采样在 Java 侧 (`AuditProperties#sampleRate`, 按层配)。Python 只管报,
 不管该不该报 —— 采样策略只有一份实现, 改一次两边都生效, 不会出现
 "Java 以为只采 10%, Python 还在全量"这种对不上的局面。
+
+## 认证: X-KM-Audit-Token
+
+`/api/audit/events` 是服务间接口, Java 侧会校验一个共享 token。它是
+**能不能写**的问题, 和信封里的 task_id / trace_id (写的是**谁的事**) 分开:
+
+* token 管入口 —— 没有它, 任何能访问 8083 的进程都能伪造一条"任务已完成"
+* task_id / trace_id 管归属 —— Java 拿 trace_id 去 `agent_task_attempt`
+  核对, 矛盾的事件一律拒收
+
+两者缺一不可: 只有 token 时, 一个配错的 trace_id 仍然会安静地把整条链路
+挂到别的任务下; 只有身份核对时, 伪造者可以编一个自洽的 (task, trace) 对。
+
+token 对不上时服务端回 **401** (而不是 400) —— 那是"配置不一致"的信号,
+和"报文写错了"要分开看。这里单独判一下, 是为了让日志直接说清该改哪边。
 """
 
 from __future__ import annotations
@@ -135,11 +150,15 @@ class AuditReporter:
         trace_id: str | None = None,
         tenant_id: str | None = None,
         actor: str | None = None,
+        token: str | None = None,
         timeout: float = 2.0,
         client: httpx.AsyncClient | None = None,
         max_batch: int = 50,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        # 服务间认证头。为空时不发 —— 服务端若配了 token 会回 401, 这比在这里
+        # 抛异常好: 审计是旁路, 构造 reporter 失败会反过来把 /chat 搞挂。
+        self._headers = {"X-KM-Audit-Token": token} if token else {}
         # 这四个是【任务身份】, 由调用方从 POST /api/tasks 的响应里转交。
         # Python 不生成、不推断、不补默认值 —— 理由见 app/main.py 里
         # ChatRequest.trace_id 那段注释。
@@ -333,7 +352,21 @@ class AuditReporter:
                 await client.aclose()
 
     async def _post(self, client: httpx.AsyncClient, batch: list[dict[str, Any]]) -> None:
-        response = await client.post(f"{self._base_url}/api/audit/events", json=batch)
+        response = await client.post(
+            f"{self._base_url}/api/audit/events",
+            json=batch,
+            # 空 dict 时 httpx 不会额外做任何事, 所以不需要条件传参
+            headers=self._headers,
+        )
+        if response.status_code == 401:
+            # ★ 单独判 401 ★ 它不是"报文写错了", 而是"两边 token 不一致"。
+            # 混在通用的 400 分支里, 排查的人会先去翻报文格式, 方向就错了。
+            self._drop(
+                len(batch),
+                "提交被拒 HTTP 401 —— X-KM-Audit-Token 与 Java 侧 "
+                "km.audit.ingest.token 不一致",
+            )
+            return
         if response.status_code >= 400:
             # 400 = 报文被校验挡了, 那是本模块的 bug (字段名写错 / 枚举值写错),
             # 值得让日志难看一下。202 之外的一切都当失败。
@@ -354,9 +387,21 @@ class AuditReporter:
 
         accepted = result.get("accepted", len(batch))
         if accepted < len(batch):
+            # rejected 是"身份核对没过"或"映射失败", 和"网络失败"不是一个
+            # 排查方向 —— 把它一起打出来, 日志才直接指向原因。
             self._drop(
                 len(batch) - accepted,
-                f"服务端收下 {accepted} / 收到 {result.get('received')} 条",
+                f"服务端收下 {accepted} / 收到 {result.get('received')} 条 "
+                f"(rejected={result.get('rejected')})",
+            )
+        # 收下了但身份没核实: 多半是 traceId 和任务服务那边对不上。
+        # 不算丢事件, 所以不调用 _drop; 但必须留痕 —— 否则这个指标
+        # 只会活在 Java 的计数里, 而 Python 这边"看起来一切正常"。
+        if result.get("unverified"):
+            logger.warning(
+                "审计身份未核实 %s 条 task=%s —— 检查 traceId 是否来自任务创建响应",
+                result.get("unverified"),
+                self._task_id,
             )
 
     def _drop(self, count: int, reason: str) -> None:

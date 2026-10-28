@@ -51,8 +51,10 @@ public class AgentTask {
     /**
      * 【最近一次执行】的 traceId, 跨 Java/Python 透传。
      *
-     * <p>它不是"任务的 ID": 任务和调用链是 1:N (每次重试一条新链), 见
-     * {@code TaskService.newTraceId()}。现在重试还没实现, 所以实际是 1:1。
+     * <p>它不是"任务的 ID": 任务和调用链是 1:N —— 每次重试生成一条新链
+     * (见 {@code TaskService.retry()} 和 {@code newTraceId()})。这个字段是
+     * 可变指针, 指向当前那次执行; 审计和状态上报的权威来源是
+     * {@code agent_task_attempt}, 不是这一列。
      */
     private String traceId;
 

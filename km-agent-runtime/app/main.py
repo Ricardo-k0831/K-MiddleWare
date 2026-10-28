@@ -27,12 +27,17 @@ from app.config import get_settings
 from app.graph.agent import build_agent
 from app.mcp_adapter import TaskIdentity, ToolProvider, build_tool_provider, task_identity
 from app.task_state import (
+    CANCELLED,
     COMPLETED,
     FAILED,
     THINKING,
     TaskStateCallbackHandler,
     TaskStateReporter,
 )
+
+# /chat 入口会拒绝终态任务。集合放在这里而不是内联, 是因为 Java 侧的
+# TaskStatus.isTerminal() 是同样的三分法 —— 两边必须一起改。
+_TERMINAL_TASK_STATUSES = frozenset({COMPLETED, FAILED, CANCELLED})
 
 # Windows 控制台默认 GBK, 中文日志会变成乱码。强制 UTF-8 输出。
 if hasattr(sys.stdout, "reconfigure"):
@@ -272,9 +277,22 @@ async def _verify_task_identity(
     唯一事实源就是 Java, Java 不在的时候本来也上报不了任何东西; 与其
     "跑完但什么都没记下", 不如一开始就说"现在跑不了"。
 
-    核对的是 {@code agent_task.traceId}(最近一次执行的 trace)。重试落地后
-    它应当换成"该 trace 对应的 attempt 是否还开着", 那需要任务服务再开一个
-    查询接口 —— 现在 1:1, 用任务上的字段足够, 不做多余的接口。
+    核对两件事, 顺序不能反:
+
+    1. **身份**: {@code agent_task.traceId} 必须等于请求带来的 trace。
+       重试后这一列会滚到新链上, 旧 trace 自然在这里被拒 —— 正是想要的:
+       上一遍的执行已经闭链, 不能借尸还魂。
+    2. **生命周期**: 终态任务不能再进 /chat。trace 一致但任务已经
+       COMPLETED / FAILED / CANCELLED 时, 唯一正确的下一步是
+       {@code POST /api/tasks/{id}/retry} 拿一个新 trace, 而不是原地重跑。
+
+    为什么要专门查状态, 而不是只靠 Java 在 PATCH 上报时拒: 只靠上报的话,
+    Agent 会先跑完一整轮 LLM 和工具 (花真金白银), 然后所有上报和审计
+    都被拒; 而入口这一道只要几十毫秒。见上面"为什么在入口做"。
+
+    重试后 {@code agent_task.traceId} 指向的正是新开的那条 attempt,
+    所以"用任务上的字段"在 1:N 之后依然成立 —— 它始终指向**当前**那次
+    执行, 不需要额外接口去查 attempt 是否还开着。
     """
     url = f"{settings.km_task_service_url.rstrip('/')}/api/tasks/{task_id}"
     # 允许注入 client: 测试塞 MockTransport 进来, 和 TaskStateReporter 同一个写法。
@@ -302,13 +320,14 @@ async def _verify_task_identity(
         )
 
     try:
-        actual_trace_id = (response.json() or {}).get("traceId")
+        task = response.json() or {}
     except ValueError as ex:
         raise HTTPException(
             status_code=502,
             detail=f"任务服务返回的不是合法 JSON: {response.text[:200]}",
         ) from ex
 
+    actual_trace_id = task.get("traceId")
     if actual_trace_id != trace_id:
         # 409 而不是 400: 报文本身合法, 是"执行身份"与任务当前状态冲突 ——
         # 和 Java 侧 EXECUTION_MISMATCH 用同一个码。
@@ -317,6 +336,19 @@ async def _verify_task_identity(
             detail=(
                 f"执行身份不匹配: task_id={task_id} 当前执行是 {actual_trace_id}, "
                 f"请求带的是 {trace_id}。请用任务创建响应里的 traceId。"
+            ),
+        )
+
+    # trace 对得上, 但任务已经结束 —— 这次"执行"确实存在过, 只是已经闭链。
+    # 放行的话, Agent 会跑完一整轮, 而 Java 会拒绝它的每一条上报和审计
+    # (终态不可离开), 用户拿到的是一份"看起来正常"的答案。必须在入口拒。
+    status = task.get("status")
+    if status in _TERMINAL_TASK_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"任务已处于终态 {status}, 不能再次执行: task_id={task_id}。"
+                f"需要重跑请先 POST /api/tasks/{task_id}/retry 获取新的 traceId。"
             ),
         )
 
@@ -410,6 +442,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
             trace_id=identity.trace_id if identity is not None else None,
             tenant_id=identity.tenant_id if identity is not None else None,
             actor=identity.actor if identity is not None else None,
+            # 服务间认证: 和 Java 侧 km.audit.ingest.token 必须一致, 否则
+            # /api/audit/events 回 401, 表现是"审计一条都没有"。
+            token=settings.audit_ingest_token,
             timeout=settings.km_task_service_timeout_seconds,
         )
         await audit.start()

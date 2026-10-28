@@ -46,6 +46,8 @@ class FakeJava:
 
     def __init__(self, status_code: int = 202, accepted_delta: int = 0) -> None:
         self.batches: list[list[dict]] = []
+        # 每个请求的头也记下来 —— 认证 token 走的是头, 不记就验不了
+        self.headers: list[httpx.Headers] = []
         self.status_code = status_code
         self.accepted_delta = accepted_delta
 
@@ -53,6 +55,7 @@ class FakeJava:
         def handle(request: httpx.Request) -> httpx.Response:
             batch = json.loads(request.content)
             self.batches.append(batch)
+            self.headers.append(request.headers)
             received = len(batch)
             return httpx.Response(
                 self.status_code,
@@ -145,6 +148,62 @@ def test_java拒收时只记下来不抛() -> None:
         reporter.emit(EVENT_LLM_CALL)
         reporter.emit(EVENT_LLM_CALL)
         await reporter.aclose()  # ← 不该抛
+        dropped = reporter.dropped
+        await client.aclose()
+        return dropped
+
+    assert asyncio.run(scenario()) == 2
+
+
+def test_提交时带上内部认证token() -> None:
+    """X-KM-Audit-Token 是服务间认证, 不是信封字段。
+
+    它不随事件走, 而是随 HTTP 请求走 —— 所以这里断言的是请求头,
+    不是 batch 里的某个键。头名必须和 Java 的 AuditHeaders.INGEST_TOKEN
+    逐字一致, 拼错一个字符的结果是每条审计都 401, 而 Python 侧只是
+    "丢了", 看不出原因。
+    """
+    fake = FakeJava()
+
+    async def scenario() -> None:
+        reporter, client = make_reporter(fake, token="t-1")
+        await reporter.start()
+        reporter.emit(EVENT_LLM_CALL)
+        await reporter.aclose()
+        await client.aclose()
+
+    asyncio.run(scenario())
+    assert fake.headers, "没有发出任何请求"
+    assert fake.headers[0]["X-KM-Audit-Token"] == "t-1"
+
+
+def test_没配token时不发空的认证头() -> None:
+    # 发一个空串和"没发"在服务端是两回事: 后者能走"认证已关闭"的分支,
+    # 前者会被当成"带了一个错 token"而 401。
+    fake = FakeJava()
+
+    async def scenario() -> None:
+        reporter, client = make_reporter(fake)
+        await reporter.start()
+        reporter.emit(EVENT_LLM_CALL)
+        await reporter.aclose()
+        await client.aclose()
+
+    asyncio.run(scenario())
+    assert "X-KM-Audit-Token" not in fake.headers[0]
+
+
+def test_token不一致时只丢事件不抛异常() -> None:
+    # 401 是配置问题, 不是报文问题。它必须和别的失败一样被吞掉 ——
+    # 否则一个 token 配错会把 /chat 的正常响应也带崩。
+    fake = FakeJava(status_code=401)
+
+    async def scenario() -> int:
+        reporter, client = make_reporter(fake, token="wrong")
+        await reporter.start()
+        reporter.emit(EVENT_LLM_CALL)
+        reporter.emit(EVENT_LLM_CALL)
+        await reporter.aclose()
         dropped = reporter.dropped
         await client.aclose()
         return dropped

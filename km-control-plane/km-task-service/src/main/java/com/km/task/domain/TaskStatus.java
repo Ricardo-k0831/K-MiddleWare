@@ -22,6 +22,12 @@ package com.km.task.domain;
  *
  * 注意 {@code TOOL_CALLING -> THINKING} 是合法且高频的流转:
  * ReAct 的本质是循环, 调完工具要回到思考, 一次请求可能走好几轮。
+ *
+ * <p>上面这张图只画了<b>状态上报</b>能走的边。还有一条图外的边:
+ * {@code FAILED -> PENDING} —— 它只由控制面的
+ * {@code POST /api/tasks/{id}/retry} 触发, 不走 {@code isAllowed}。
+ * 所以"终态不可离开"对 Python 的上报仍然严格成立, 见
+ * {@link TaskStatusMachine#isRetryAllowed}。
  */
 public enum TaskStatus {
 

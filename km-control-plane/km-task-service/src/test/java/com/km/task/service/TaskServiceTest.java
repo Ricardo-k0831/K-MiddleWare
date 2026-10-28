@@ -12,6 +12,8 @@ import com.km.task.domain.AgentTaskEvent;
 import com.km.task.domain.TaskEventSource;
 import com.km.task.domain.TaskStatus;
 import com.km.task.error.ExecutionMismatchException;
+import com.km.task.error.MaxRetryExceededException;
+import com.km.task.error.RetryNotAllowedException;
 import com.km.task.mapper.AgentTaskAttemptMapper;
 import com.km.task.mapper.AgentTaskEventMapper;
 import com.km.task.mapper.AgentTaskMapper;
@@ -29,6 +31,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -243,6 +246,179 @@ class TaskServiceTest {
         assertEquals(inserted.get().getTraceId(), attempt.getTraceId());
         assertEquals(1, attempt.getAttemptNo());
         assertEquals(AgentTaskAttempt.RUNNING, attempt.getStatus());
+    }
+
+    // ------------------------------------------------------------------
+    //  重试: 同一个任务, 换一条链
+    // ------------------------------------------------------------------
+
+    @Test
+    void 重试生成新trace并开启下一代执行() {
+        AgentTask failed = task(TaskStatus.FAILED, TRACE_ID);
+        failed.setFinishedAt(LocalDateTime.now());
+        AgentTask updated = task(TaskStatus.PENDING, "滚动指针新值");
+        updated.setRetryCount(1);
+        when(taskMapper.selectById(TASK_ID)).thenReturn(failed, updated);
+        when(attemptMapper.selectCount(any())).thenReturn(0L);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(attemptMapper.insert(any(AgentTaskAttempt.class))).thenReturn(1);
+        when(eventMapper.insert(any(AgentTaskEvent.class))).thenReturn(1);
+
+        service.retry(TASK_ID, "MCP 网关 500, 人工确认后重试");
+
+        // ---- 新执行 ----
+        ArgumentCaptor<AgentTaskAttempt> attemptCaptor =
+                ArgumentCaptor.forClass(AgentTaskAttempt.class);
+        verify(attemptMapper).insert(attemptCaptor.capture());
+        AgentTaskAttempt attempt = attemptCaptor.getValue();
+
+        assertEquals(2, attempt.getAttemptNo(), "第一次重试应当开第 2 次执行");
+        assertEquals(AgentTaskAttempt.RUNNING, attempt.getStatus());
+        assertEquals(TASK_ID, attempt.getAgentTaskId());
+        // ★ 新链必须和旧链不同, 也不该长得像测试里的假 trace ★
+        assertNotEquals(TRACE_ID, attempt.getTraceId(), "重试复用了旧 trace, 两条链会混在一起");
+        assertEquals(32, attempt.getTraceId().length());
+
+        // ---- 事件: FAILED -> PENDING, 且带得上跨链信息 ----
+        ArgumentCaptor<AgentTaskEvent> eventCaptor =
+                ArgumentCaptor.forClass(AgentTaskEvent.class);
+        verify(eventMapper).insert(eventCaptor.capture());
+        AgentTaskEvent event = eventCaptor.getValue();
+
+        assertEquals(TaskStatus.FAILED.name(), event.getFromStatus());
+        assertEquals(TaskStatus.PENDING.name(), event.getToStatus());
+        assertEquals(TaskEventSource.JAVA_GATEWAY.name(), event.getSource(),
+                "手动重试不是系统补偿, 不该记成 SYSTEM_RETRY");
+        assertEquals(2, event.getDetail().get("attemptNo"));
+        assertEquals(attempt.getTraceId(), event.getDetail().get("traceId"));
+        assertEquals(TRACE_ID, event.getDetail().get("previousTraceId"));
+        assertEquals("MCP 网关 500, 人工确认后重试", event.getDetail().get("reason"));
+
+        // ---- 审计: trace 用新链, 且能看出它接在旧链后面 ----
+        ArgumentCaptor<AuditEvent> auditCaptor = ArgumentCaptor.forClass(AuditEvent.class);
+        verify(audit).publish(auditCaptor.capture());
+        AuditEvent published = auditCaptor.getValue();
+
+        // ★ 这条事件属于【新】执行。如果这里用了任务表上读到的旧 trace,
+        //   重试事件的审计链会挂到上一遍的失败链上, 按 trace 统计会串。
+        assertEquals(attempt.getTraceId(), published.traceId());
+        assertEquals(TASK_ID, published.taskId());
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> requestBody = (Map<String, Object>) published.requestBody();
+        assertEquals(TaskStatus.FAILED.name(), requestBody.get("from"));
+        assertEquals(TaskStatus.PENDING.name(), requestBody.get("to"));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> detail = (Map<String, Object>) requestBody.get("detail");
+        assertEquals(2, detail.get("attemptNo"));
+        assertEquals(TRACE_ID, detail.get("previousTraceId"),
+                "审计里要能回答『这条新链从哪条链接过来』");
+
+        // ---- 任务行: CAS 条件 + 清理上一轮的状态 ----
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Wrapper<AgentTask>> updateCaptor =
+                ArgumentCaptor.forClass(Wrapper.class);
+        verify(taskMapper).update(isNull(), updateCaptor.capture());
+        String sqlSet = updateCaptor.getValue().getSqlSet().toString();
+
+        assertTrue(sqlSet.contains("trace_id"), "没把滚动指针切到新链: " + sqlSet);
+        assertTrue(sqlSet.contains("retry_count"), "没增加重试次数: " + sqlSet);
+        assertTrue(sqlSet.contains("status"), "没回到 PENDING: " + sqlSet);
+        // 上一轮的终态痕迹必须清掉, 否则任务显示 PENDING 却挂着失败原因
+        assertTrue(sqlSet.contains("finished_at"), "没清 finished_at: " + sqlSet);
+        assertTrue(sqlSet.contains("error_msg"), "没清 error_msg: " + sqlSet);
+        assertTrue(sqlSet.contains("result"), "没清 result: " + sqlSet);
+        // 新 trace 真的进了 SQL 参数, 而不是只存在于 attempt 对象里
+        LambdaUpdateWrapper<AgentTask> update =
+                (LambdaUpdateWrapper<AgentTask>) updateCaptor.getValue();
+        assertTrue(update.getParamNameValuePairs().containsValue(attempt.getTraceId()),
+                "新 trace 没有写进 UPDATE 参数");
+    }
+
+    @Test
+    void 重试序号由retryCount推导_已重试两次时下一次是第4次() {
+        AgentTask failed = task(TaskStatus.FAILED, TRACE_ID);
+        failed.setRetryCount(2);
+        failed.setMaxRetry(3);
+        when(taskMapper.selectById(TASK_ID))
+                .thenReturn(failed, task(TaskStatus.PENDING, "新"));
+        when(attemptMapper.selectCount(any())).thenReturn(0L);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(attemptMapper.insert(any(AgentTaskAttempt.class))).thenReturn(1);
+
+        service.retry(TASK_ID, null);
+
+        ArgumentCaptor<AgentTaskAttempt> captor =
+                ArgumentCaptor.forClass(AgentTaskAttempt.class);
+        verify(attemptMapper).insert(captor.capture());
+        // 首次 attempt_no=1, 重试 2 次后下一代是 4 —— 不是 retry_count+1
+        assertEquals(4, captor.getValue().getAttemptNo());
+    }
+
+    @Test
+    void 只有FAILED的任务可以重试() {
+        for (TaskStatus status : TaskStatus.values()) {
+            if (status == TaskStatus.FAILED) {
+                continue;
+            }
+            when(taskMapper.selectById(TASK_ID)).thenReturn(task(status, TRACE_ID));
+
+            assertThrows(RetryNotAllowedException.class,
+                    () -> service.retry(TASK_ID, null),
+                    status + " 不该允许重试");
+        }
+
+        // 一条都不该落库, 一条审计也不该发
+        verify(taskMapper, never()).update(any(), any());
+        verify(attemptMapper, never()).insert(any(AgentTaskAttempt.class));
+        verifyNoInteractions(eventMapper);
+        verify(audit, never()).publish(any());
+    }
+
+    @Test
+    void 次数用尽时拒绝_且不碰任务行() {
+        AgentTask failed = task(TaskStatus.FAILED, TRACE_ID);
+        failed.setRetryCount(3);
+        failed.setMaxRetry(3);
+        when(taskMapper.selectById(TASK_ID)).thenReturn(failed);
+
+        assertThrows(MaxRetryExceededException.class, () -> service.retry(TASK_ID, null));
+
+        verify(taskMapper, never()).update(any(), any());
+        verify(attemptMapper, never()).insert(any(AgentTaskAttempt.class));
+        verifyNoInteractions(eventMapper);
+        verify(audit, never()).publish(any());
+    }
+
+    @Test
+    void 还有执行未闭链时拒绝_不能凭空再开一条() {
+        when(taskMapper.selectById(TASK_ID))
+                .thenReturn(task(TaskStatus.FAILED, TRACE_ID));
+        when(attemptMapper.selectCount(any())).thenReturn(1L);
+
+        RetryNotAllowedException ex = assertThrows(RetryNotAllowedException.class,
+                () -> service.retry(TASK_ID, null));
+
+        assertTrue(ex.getMessage().contains("未闭链"));
+        verify(taskMapper, never()).update(any(), any());
+        verify(attemptMapper, never()).insert(any(AgentTaskAttempt.class));
+    }
+
+    @Test
+    void 并发重试输掉的一方不写任何东西() {
+        when(taskMapper.selectById(TASK_ID))
+                .thenReturn(task(TaskStatus.FAILED, TRACE_ID));
+        when(attemptMapper.selectCount(any())).thenReturn(0L);
+        // 另一个请求在我们读取之后抢先更新了 (status 或 retry_count 变了)
+        when(taskMapper.update(isNull(), any())).thenReturn(0);
+
+        assertThrows(RetryNotAllowedException.class, () -> service.retry(TASK_ID, null));
+
+        // 关键: 输的一方不能留下一条孤儿 attempt, 也不能发一条假的审计
+        verify(attemptMapper, never()).insert(any(AgentTaskAttempt.class));
+        verifyNoInteractions(eventMapper);
+        verify(audit, never()).publish(any());
     }
 
     // ------------------------------------------------------------------

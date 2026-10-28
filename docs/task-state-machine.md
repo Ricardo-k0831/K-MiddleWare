@@ -59,10 +59,17 @@ ReAct 的本质是一个**循环**，状态机必须体现这一点：
                        └───────────────────────────────┘
 
    任意非终态 ──▶ CANCELLED
+
+   FAILED ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶ PENDING
+          （仅 POST /api/tasks/{id}/retry，控制面专有）
 ```
 
 关键点：`TOOL_CALLING → THINKING` 是**合法且高频**的流转 ——
 Agent 调完工具要回到思考。一次 `/chat` 可能走好几轮。
+
+虚线是**重试边**：它是唯一能离开终态的边，但**不在上报用的流转表里**。
+PATCH `/status` 永远不能从 FAILED 出发，只有 `TaskService.retry()` 会走到它。
+`COMPLETED` / `CANCELLED` 没有这条边（理由见"重试"一节）。
 
 ### 合法性规则
 
@@ -71,10 +78,15 @@ Python 只能**上报**，不能**决定**状态。
 
 | 规则 | 说明 |
 |---|---|
-| 终态不可离开 | `COMPLETED` / `FAILED` / `CANCELLED` 是终点，任何回转都是 bug |
+| 终态不可离开（上报路径） | `COMPLETED` / `FAILED` / `CANCELLED` 是终点；**唯一例外**是控制面的 `FAILED → PENDING` 重试边 |
 | 不能跳级 | `PENDING` 不能直接到 `TOOL_CALLING`（必须先 THINKING） |
 | 同态上报幂等 | 重复上报当前状态视为成功、不写事件（见下方"幂等"） |
 | 非法流转记为异常 | 拒绝更新，但**记 WARN 日志** —— 它说明 Python 侧逻辑有问题 |
+
+重试边由 `TaskStatusMachine.isRetryAllowed()` **单独判定**，不加进
+`isAllowed()` 的流转表。两条规则分开之后，
+「上报不能离开终态」仍然由 6×6 组合的穷举测试锁死；如果谁为了省事把
+`FAILED → PENDING` 加进流转表，`TaskStatusMachineTest` 会立刻红。
 
 ---
 
@@ -121,10 +133,11 @@ Python 只能**上报**，不能**决定**状态。
 ### 接口
 
 ```
-POST   /api/tasks                      创建任务          -> { agentTaskId }
+POST   /api/tasks                      创建任务          -> 任务（含 traceId）
 GET    /api/tasks/{id}                 查询任务（Redis 优先, miss 回落 MySQL）
 GET    /api/tasks/{id}/events          状态流转历史
 PATCH  /api/tasks/{id}/status          状态上报（Python 调这个）
+POST   /api/tasks/{id}/retry           失败任务重试      -> 任务（含新 traceId）
 ```
 
 `PATCH /api/tasks/{id}/status` 请求体：
@@ -163,6 +176,92 @@ PATCH  /api/tasks/{id}/status          状态上报（Python 调这个）
 
 - 目标状态 == 当前状态 → 直接返回 200，**不写事件表**（否则事件流会被噪音淹没）
 - 加 `requestId` 去重（可选，Phase 2 后期再做）
+
+### 重试（2026-10-28，手动 API 先行）
+
+**重试不是 Python 上报的一个状态，是控制面的一次动作。** Python 运行时只能
+说"我失败了"；要不要再试、什么时候试，是 Java 的事。所以接口是
+`POST /api/tasks/{id}/retry`。
+
+这个接口**只负责开新链，不负责调用 Python**：它返回新的 `traceId`，调用方
+（人工脚本 / 将来的调度器）拿它再去 `POST /chat`。自动派发是下一轮的事，
+手动 API 是它的前置 —— 先把"开新 attempt"做成一个原子动作。
+
+请求体可选：
+
+```json
+{ "reason": "MCP 网关 500, 人工确认后重试" }
+```
+
+#### 一次重试，一个事务里做七件事
+
+1. 状态机校验：**只有 FAILED** 能重试
+2. 次数校验：`retry_count < max_retry`
+3. 不变量校验：该任务不能有未闭链的 attempt
+4. CAS 更新任务行：
+   `WHERE status='FAILED' AND retry_count=旧值`
+   → `status=PENDING`、`trace_id=新 trace`、`retry_count+1`、
+   清空 `finished_at` / `error_msg` / `result`
+5. 插入 `attempt_no = retry_count + 2` 的 RUNNING 记录
+6. 写 `FAILED → PENDING` 事件
+7. 发 TASK_LIFECYCLE 审计（事务提交后才真正投 MQ）
+
+CAS 同时带上 `retry_count` 是为了并发：多个重试请求读到同一个
+`FAILED + retry_count=0` 时，只有一个能更新成功，输的一方 409。
+输的一方**不会**留下 attempt / 事件 / 审计 —— 那些都在 CAS 成功之后才写。
+
+#### 不引入 `RETRYING` 状态
+
+新 attempt、回 PENDING、事件、审计全在同一个事务里，外部看不到任何中间态。
+多一个状态就要多定义"它能去哪 / 超时怎么办 / 谁推进它"，而它存在的几毫秒
+没有任何人观察得到。**"换一条链重新排队"本身就是这个动作的全部语义。**
+
+#### 为什么是新 trace
+
+一条 trace 的边界是**一次执行**。复用旧 trace 会：
+
+- 把两遍执行混成一条链，分不清工具调用属于哪一遍
+- 上一遍已经闭链的 attempt 会让新上报被当成"迟到的旧执行"拒掉
+
+任务和链是 1:N，靠 `task_id` 关联；`agent_task.trace_id` 只是"当前执行"的
+滚动指针。重试后旧 trace 立刻失效：拿它进 `/chat` 或 PATCH 上报都是 409。
+
+#### 为什么 COMPLETED / CANCELLED 不能重试
+
+- **COMPLETED**：已经成功，"再试一次"没有业务含义。要重跑是**新建任务**
+  （新的 intent 上下文、新的 task_id），不是重试。
+- **CANCELLED**：取消是显式意图，不能被重试悄悄推翻。将来要做"恢复"，
+  应当是一条独立的操作。
+
+#### 错误码
+
+| HTTP | `error` | 含义 |
+|---|---|---|
+| 409 | `RETRY_NOT_ALLOWED` | 不是 FAILED / 还有执行未闭链 / 并发冲突 |
+| 409 | `MAX_RETRY_EXCEEDED` | `retry_count >= max_retry`（`maxRetry=0` 表示一次都不许） |
+| 404 | `TASK_NOT_FOUND` | 任务不存在 |
+
+#### 审计上的样子
+
+重试事件盖**新链**的 trace，`request_body.detail` 里带
+`attemptNo` / `traceId` / `previousTraceId` / `reason`。于是两条链都能完整
+查到，而且能看出第二遍接在第一遍的哪里：
+
+```
+trace 364a280c: 创建 -> THINKING -> FAILED
+trace 488db1d0: FAILED -> PENDING (attemptNo=2, previousTraceId=364a280c)
+                -> THINKING -> COMPLETED
+```
+
+#### 还没做的
+
+- **自动重试**：定时扫描 / 退避 / 失败后自动决定要不要再试。它需要
+  Java → Python 的调度通道，而手动 API 是它的前置 —— 先把"开新 attempt"
+  做成原子动作，以后定时器只是多一个调用方。
+- **重试原因的操作者身份**：现在没有鉴权，审计的 `actor` 记的是任务归属
+  用户，发起重试的人不记。等接入认证再补。
+- `/chat` 入口会拒绝终态任务（409，提示调用 `/retry`）；这是重试落地时
+  一起补的，避免"Agent 白跑一整轮、所有上报都被拒"。
 
 ---
 
@@ -300,6 +399,7 @@ Phase 1 是用户**直接**调 Python：
 | 3 | Python 加 `TaskStateCallbackHandler` ✅ | 单测：mock Java 端，断言上报序列 | — |
 | 4 | `/chat` 支持 `task_id`，挂上 callback + 上报终态 ✅ | `tests/test_chat_task_wiring.py`（27 项）+ 真链路跑通 | 2, 3 |
 | 5 | smoke test 加一条任务链路的用例 ✅ | `smoke_chat.py` 用例 T | 4 |
+| 6 | 手动重试 API（FAILED→PENDING，新 trace / 新 attempt）✅ | `scripts/verify_retry.py`（43 项断言）+ MySQL / audit_log 双信道核对 | 2 |
 
 **第 1 步是硬前置** —— 第 2 步之后全部依赖 MySQL。这也是为什么
 docker-compose 悬了两周是个真问题：它不是"顺便验一下"，而是卡着整条路。
@@ -379,6 +479,44 @@ None -> PENDING -> THINKING -> TOOL_CALLING -> FAILED
 3. **`TOOL_CALLING -> THINKING` 这条 ReAct 回归边在真链路上被走到了。**
    在此之前它只有单测覆盖（`TaskStatusMachineTest`），是纯函数的正确性，
    不是端到端的事实。
+
+### 第 6 步的实测结论（2026-10-28）
+
+`scripts/verify_retry.py` 打真服务（MySQL + RocketMQ 都在），**43/43 通过**。
+覆盖的不只是"接口返回 200"，而是七条容易悄悄退化的规则：
+
+| 要验的事 | 结果 |
+|---|---|
+| 重试换新 trace，任务表指针滚过去 | ✅ |
+| 旧 trace 再上报 / 再进 `/chat` 都 409 | ✅ |
+| 上一次执行的 attempt 已闭链，新 attempt 是 RUNNING | ✅ |
+| `retry_count` / `max_retry` 的 `>=` 边界（含 `maxRetry=0`） | ✅ |
+| COMPLETED / PENDING 任务不能重试 | ✅ |
+| 3 个并发重试只有 1 个成功，只产生 1 条 FAILED→PENDING 事件 | ✅ |
+| 不存在的任务 404，且错误码是 `TASK_NOT_FOUND` | ✅ |
+
+**没有只看 API 的回显**，直接查了库（两个独立信道）：
+
+```
+attempt_no=1  trace 364a280c  FAILED   ended_at 非空
+attempt_no=2  trace 488db1d0  COMPLETED ended_at 非空
+retry_count=1  max_retry=2  agent_task.trace_id=488db1d0
+
+audit_log（按 id 排序）:
+  364a280c  创建 -> THINKING -> FAILED
+  488db1d0  FAILED -> PENDING  attemptNo=2  previousTraceId=364a280c
+  488db1d0  PENDING -> THINKING -> COMPLETED
+```
+
+并发那条用例尤其能说明 CAS 生效：3 个请求同时打同一个 FAILED 任务，
+**只多出 1 行 attempt、1 条事件、1 条审计**；如果 CAS 没带上
+`retry_count`，就会有两个赢家，第二条 attempt 会撞唯一索引变成 500。
+
+另外在真 Java 服务上跑了一遍 Python 的入口校验（`_verify_task_identity`）：
+
+- COMPLETED + 当前 trace → 409，提示先调 `/retry`
+- COMPLETED + 旧 trace → 409 `执行身份不匹配`
+- PENDING + 当前 trace → 放行
 
 ### 一个从 Java 侧照搬过来会出事的断言
 

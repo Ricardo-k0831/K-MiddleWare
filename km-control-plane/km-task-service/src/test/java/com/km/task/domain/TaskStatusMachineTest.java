@@ -130,5 +130,47 @@ class TaskStatusMachineTest {
         assertFalse(TaskStatusMachine.isAllowed(TaskStatus.PENDING, null));
         assertFalse(TaskStatusMachine.isAllowed(null, null));
         assertFalse(TaskStatusMachine.isNoop(null, null));
+        assertFalse(TaskStatusMachine.isRetryAllowed(null, TaskStatus.PENDING));
+        assertFalse(TaskStatusMachine.isRetryAllowed(TaskStatus.FAILED, null));
+    }
+
+    // ------------------------------------------------------------------
+    //  重试: 唯一能离开终态的边, 但只对控制面开放
+    // ------------------------------------------------------------------
+
+    /**
+     * ★ 这条断言是重试功能的安全边界 ★
+     *
+     * <p>重试允许 FAILED -> PENDING, 而上面那条"终态不能到任何状态"的
+     * 穷举测试必须仍然成立 —— 因为那条测的是 {@code isAllowed} (上报路径)。
+     * 如果实现图省事把这条边加进 {@code ALLOWED}, 两个测试会同时红:
+     * 一个说"上报不能离开终态", 一个说"重试能"。这正是想要的相互制约。
+     */
+    @Test
+    void 重试边不进入常规流转表_上报仍然不能离开终态() {
+        assertFalse(TaskStatusMachine.isAllowed(TaskStatus.FAILED, TaskStatus.PENDING),
+                "FAILED -> PENDING 不能出现在上报用的流转表里");
+    }
+
+    @Test
+    void 只有FAILED到PENDING算重试_其余25种组合都false() {
+        assertTrue(TaskStatusMachine.isRetryAllowed(TaskStatus.FAILED, TaskStatus.PENDING));
+        for (TaskStatus from : TaskStatus.values()) {
+            for (TaskStatus to : TaskStatus.values()) {
+                if (from == TaskStatus.FAILED && to == TaskStatus.PENDING) {
+                    continue;
+                }
+                assertFalse(TaskStatusMachine.isRetryAllowed(from, to),
+                        "不该允许重试: " + from + " -> " + to);
+            }
+        }
+    }
+
+    @Test
+    void 成功和取消的任务不能重试() {
+        assertFalse(TaskStatusMachine.isRetryAllowed(TaskStatus.COMPLETED, TaskStatus.PENDING),
+                "已完成的任务要重跑, 应当新建任务");
+        assertFalse(TaskStatusMachine.isRetryAllowed(TaskStatus.CANCELLED, TaskStatus.PENDING),
+                "取消是显式意图, 不能被重试悄悄推翻");
     }
 }

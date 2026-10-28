@@ -60,8 +60,8 @@ CREATE TABLE IF NOT EXISTS agent_task (
 -- 在途的上报会被盖上新执行的 trace。所以把"执行"做成有主键的行:
 --   task 1 : N attempt, 每次执行一个 trace_id, 闭链后不再改。
 --
--- 现在重试还没实现, 每个任务只有一条 RUNNING 的 attempt;
--- 加它不是为了重试, 是为了让 TASK_LIFECYCLE 的 trace_id 有正当来源。
+-- 首次执行由建任务时写入; 之后每次人工重试 (POST /api/tasks/{id}/retry)
+-- 新增一行 attempt_no+1 的 RUNNING 记录。同一任务最多一条 ended_at IS NULL。
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS agent_task_attempt (
     id            BIGINT       NOT NULL AUTO_INCREMENT,

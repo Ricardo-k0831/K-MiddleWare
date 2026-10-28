@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     km_task_service_url: str = "http://localhost:8083"
     # 回调是旁路, 宁可丢弃也不要拖慢 Agent 主流程 —— 所以超时给得短。
     km_task_service_timeout_seconds: float = 2.0
+    # 提交审计时的内部认证 token (HTTP 头 X-KM-Audit-Token)。
+    #
+    # 必须和 Java 侧 km.audit.ingest.token 一致, 否则 /api/audit/events 会回 401,
+    # 而表现只是"审计一条都没有" —— 所以宁可把它写进显式配置并在 .env.example
+    # 里留位置, 也不要在代码里偷偷写死。
+    #
+    # 默认值和 Java 侧一样是开发占位值 (Java 启动时会为它打一条 WARN)。
+    # 生产用 AUDIT_INGEST_TOKEN 环境变量覆盖, 和 Java 的 KM_AUDIT_INGEST_TOKEN 配对。
+    audit_ingest_token: str = "dev-audit-token-change-me"
 
     # ---------- PostgreSQL ----------
     postgres_host: str = "localhost"

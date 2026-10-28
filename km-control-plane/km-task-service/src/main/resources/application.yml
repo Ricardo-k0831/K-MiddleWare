@@ -55,6 +55,19 @@ km:
     #
     default-sample-rate: 1.0
 
+    # 审计提交入口 (/api/audit/events) 的信任边界。
+    #
+    # 这两项虽然挂在 km.audit 下, 但只对任务服务有效 —— 见
+    # AuditIngestProperties 的类注释 (为什么没有和 AuditProperties 合并)。
+    ingest:
+      # Python 侧用 AUDIT_INGEST_TOKEN 配同一个值, 它会以
+      # X-KM-Audit-Token 头发过来。空 = 关闭校验, 只应在本地这么做。
+      token: ${KM_AUDIT_INGEST_TOKEN:dev-audit-token-change-me}
+      # 带了 traceId 却查不到对应执行时: warn = 收下并计入 unverified,
+      # strict = 拒收。数据库故障导致的查询失败在两种模式下都放行 ——
+      # 审计入口不额外引入"必须查库成功"的同步依赖。
+      identity-check: ${KM_AUDIT_IDENTITY_CHECK:warn}
+
 logging:
   level:
     com.km.task: DEBUG
