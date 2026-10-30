@@ -68,6 +68,30 @@ km:
       # 审计入口不额外引入"必须查库成功"的同步依赖。
       identity-check: ${KM_AUDIT_IDENTITY_CHECK:warn}
 
+  # 自动重试 (见 com.km.task.retry)
+  #
+  # ★ 默认关闭 ★ 它会在没人点按钮的时候自己开新链、调 LLM —— 会花钱、
+  # 会改任务状态。打开是一个显式决定, 所以要用环境变量:
+  #   KM_RETRY_ENABLED=true mvn spring-boot:run
+  retry:
+    scheduler:
+      enabled: ${KM_RETRY_ENABLED:false}
+      interval-ms: ${KM_RETRY_INTERVAL_MS:10000}
+      batch-size: ${KM_RETRY_BATCH_SIZE:20}
+      # 指数退避: 第 n 次失败后等 min(base * 2^n, max) 秒。
+      base-backoff-seconds: ${KM_RETRY_BASE_BACKOFF_SECONDS:30}
+      max-backoff-seconds: ${KM_RETRY_MAX_BACKOFF_SECONDS:300}
+      # 只扫这个租户; 空 = 全部。会花钱的自动行为, 先灰度一个租户再放开。
+      tenant: ${KM_RETRY_TENANT:}
+    dispatch:
+      # Python Agent 运行时地址 (不带 /chat)
+      chat-url: ${KM_PYTHON_CHAT_URL:http://localhost:8000}
+      connect-timeout-seconds: ${KM_RETRY_CONNECT_TIMEOUT_SECONDS:5}
+      # 必须远大于一次 Agent 执行; 读超时不算"没派发成功", 见 RetryDispatcher
+      read-timeout-seconds: ${KM_RETRY_READ_TIMEOUT_SECONDS:600}
+      concurrency: ${KM_RETRY_CONCURRENCY:2}
+      queue-capacity: ${KM_RETRY_QUEUE_CAPACITY:100}
+
 logging:
   level:
     com.km.task: DEBUG

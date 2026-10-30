@@ -184,8 +184,9 @@ POST   /api/tasks/{id}/retry           失败任务重试      -> 任务（含�
 `POST /api/tasks/{id}/retry`。
 
 这个接口**只负责开新链，不负责调用 Python**：它返回新的 `traceId`，调用方
-（人工脚本 / 将来的调度器）拿它再去 `POST /chat`。自动派发是下一轮的事，
-手动 API 是它的前置 —— 先把"开新 attempt"做成一个原子动作。
+（人工脚本 / 自动调度器）拿它再去 `POST /chat`。手动 API 先落地，是因为
+自动派发需要它这个原子动作；调度器已在 2026-10-29 接上，见下面的
+[自动重试](#自动重试2026-10-29)。
 
 请求体可选：
 
@@ -253,11 +254,78 @@ trace 488db1d0: FAILED -> PENDING (attemptNo=2, previousTraceId=364a280c)
                 -> THINKING -> COMPLETED
 ```
 
+### 自动重试（2026-10-29）
+
+手动重试只差最后一步：**谁去调 `/chat`**。自动重试就是那个调用方。
+
+#### 为什么是定时扫描，不是失败时排一个定时器
+
+失败那一刻往内存里排 `ScheduledFuture`，进程一重启就全丢；多实例部署时每个
+实例各排一份，会重复派发。状态已经在库里（`status` / `finished_at` /
+`retry_count`），由数据库当唯一事实来源，扫描器只回答"谁到期了"：
+
+```sql
+WHERE status = 'FAILED'
+  AND finished_at IS NOT NULL
+  AND retry_count < max_retry
+  AND intent IS NOT NULL AND TRIM(intent) <> ''
+  [AND tenant_id = ?]            -- 灰度
+ORDER BY finished_at ASC LIMIT 20
+```
+
+捞出来之后**还要逐条再判一次退避**（粗筛只按 base 过滤），然后调用
+`TaskService.retry(id, "自动重试", SYSTEM_RETRY)` —— 状态机、次数、CAS 全部
+复用，扫描器里没有第二套规则。
+
+#### 退避：`min(base * 2^retry_count, max)`
+
+`retry_count` 是"已经重试过几次"，`finished_at` 是"这一轮失败落库的时间"。
+第一次失败等 `base`，之后 2×、4×、8×…封顶 `max`。**不存 `next_retry_at`**：
+多一列就多一个可能写错、可能和事实不一致的地方，而这两个字段已经够了。
+
+默认 `base=30s`、`max=300s`。验证时用 2s/4s，跑一轮只要十几秒。
+
+#### 派发失败的分类（★ 这里最容易做错 ★）
+
+| 情况 | 判定 | 处理 |
+|---|---|---|
+| 拒绝连接 / DNS 失败 / 连接超时 | **确定没到 Python** | 标记这次 attempt FAILED（`detail.phase=DISPATCH`），任务回 FAILED，下轮退避再试 |
+| 线程池满 | 请求还没发出去 | 同上 |
+| 读超时 / HTTP 5xx | 请求**可能**已经在跑 | **只记日志，不关链**，等 Python 自己的终态上报 |
+
+第三行是重点：如果读超时也回写 FAILED，就会出现"任务显示失败、Python 还在
+跑并继续上报"的双写，后到的上报全被终态拒绝，审计里留下一串 409。结果未知
+时不要猜。真的一直不回来，属于"卡住的 PENDING"，那是另一条兜底（见下）。
+
+#### 审计与来源
+
+自动重试走和手动完全相同的七步事务，唯一区别是事件 / 审计的 `source`：
+
+- 手动：`JAVA_GATEWAY`（人/调用方显式发起）
+- 自动：`SYSTEM_RETRY`（系统按退避兜底），`reason="自动重试"`
+
+于是可以按 source 统计"有多少任务是系统救回来的"，而不用翻日志。派发失败
+回写的 `PENDING → FAILED` 也记 `SYSTEM_RETRY`，detail 带 `phase=DISPATCH` 和
+错误原因 —— 能一眼分清"Python 里任务失败"和"根本没进 Python 的门"。
+
+#### 开关与灰度
+
+默认**关闭**（`km.retry.scheduler.enabled=false`）—— 它会自己花钱，不该因为
+代码合进来就生效。打开还要能按租户灰度（`km.retry.scheduler.tenant`，空 = 全部），
+验证脚本也靠它把测试任务和历史数据隔开。
+
+```bash
+KM_RETRY_ENABLED=true \
+KM_RETRY_TENANT=retry-e2e \
+KM_PYTHON_CHAT_URL=http://localhost:8000 \
+mvn -pl km-task-service spring-boot:run
+```
+
 #### 还没做的
 
-- **自动重试**：定时扫描 / 退避 / 失败后自动决定要不要再试。它需要
-  Java → Python 的调度通道，而手动 API 是它的前置 —— 先把"开新 attempt"
-  做成原子动作，以后定时器只是多一个调用方。
+- **卡住的 PENDING 兜底**：派发读超时/Python 进程中途死掉时，任务会停在
+  PENDING、attempt 一直不闭链。需要一个"超过 N 分钟没进展"的扫描，但前提是
+  能确定 Python 那边真的没在跑 —— 贸然关链会制造双写，所以先不做。
 - **重试原因的操作者身份**：现在没有鉴权，审计的 `actor` 记的是任务归属
   用户，发起重试的人不记。等接入认证再补。
 - `/chat` 入口会拒绝终态任务（409，提示调用 `/retry`）；这是重试落地时
@@ -400,6 +468,7 @@ Phase 1 是用户**直接**调 Python：
 | 4 | `/chat` 支持 `task_id`，挂上 callback + 上报终态 ✅ | `tests/test_chat_task_wiring.py`（27 项）+ 真链路跑通 | 2, 3 |
 | 5 | smoke test 加一条任务链路的用例 ✅ | `smoke_chat.py` 用例 T | 4 |
 | 6 | 手动重试 API（FAILED→PENDING，新 trace / 新 attempt）✅ | `scripts/verify_retry.py`（43 项断言）+ MySQL / audit_log 双信道核对 | 2 |
+| 7 | 自动重试（定时扫描 + 退避 + Java→Python 派发）✅ | `scripts/verify_auto_retry.py`（29 项断言，含假 Python 运行时） | 2, 6 |
 
 **第 1 步是硬前置** —— 第 2 步之后全部依赖 MySQL。这也是为什么
 docker-compose 悬了两周是个真问题：它不是"顺便验一下"，而是卡着整条路。
@@ -517,6 +586,34 @@ audit_log（按 id 排序）:
 - COMPLETED + 当前 trace → 409，提示先调 `/retry`
 - COMPLETED + 旧 trace → 409 `执行身份不匹配`
 - PENDING + 当前 trace → 放行
+
+### 第 7 步的实测结论（2026-10-29）
+
+`scripts/verify_auto_retry.py` 起一个假的 Python 运行时（:18080），打真服务
+（短退避 2s/4s、扫描 1s、租户 `retry-e2e`），**29/29 通过**：
+
+| 要验的事 | 结果 |
+|---|---|
+| 失败后 0.5s 内不派发，退避到期后才派发 | ✅ |
+| 自动重试换新 trace，事件 source=`SYSTEM_RETRY`，`previousTraceId` 接得上 | ✅ |
+| 派发的 payload 带原始 intent / task_id / 新 trace / tenant | ✅ |
+| `maxRetry=1`：自动重试一次后再失败就彻底停下，等两个退避周期也不再派发 | ✅ |
+| Python 不可达：任务回 FAILED，事件 `phase=DISPATCH`，次数用尽后不再试 | ✅ |
+| 没有 intent 的任务不重试，`retry_count` 不动 | ✅ |
+
+过程中踩到一个真实问题，值得记下来：**假的 Python 第一版只读
+`Content-Length`，而 JDK HttpClient 对未知长度的 body 用 chunked 发送**，
+于是它读成空 body、回了 200，剩下的 chunk 字节被 `http.server` 当成下一个
+请求的请求行 —— Java 收到的是莫名的 **HTTP 400**，第一轮因此 2 项失败。
+服务端日志（`重试派发收到 HTTP 400`）才把方向指对。修的是假服务端的读
+body 逻辑，不是产品代码：真的 FastAPI 一直支持 chunked。
+
+这也解释了为什么派发失败要分三类：这次是 HTTP 4xx（"Python 回了错"），
+如果当时把 4xx 也当"没送达"去关链，就会在 Python 可能已经开跑的情况下
+制造双写。
+
+回归防线：`RetrySchedulerTest`（8 项）+ `RetryDispatcherTest`（5 项）+
+`TaskServiceTest` 里"带来源重试"一条。
 
 ### 一个从 Java 侧照搬过来会出事的断言
 

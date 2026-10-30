@@ -3,6 +3,7 @@ package com.km.task;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * 任务服务 —— Agent 任务状态的唯一事实源。
@@ -30,6 +31,10 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * {@code com.km.task.audit.AuditLogConsumer})。这两件事共用一个服务不是巧合 ——
  * 审计要记的就是任务的状态变化。
  */
+// @EnableScheduling 只是打开调度基础设施; 真正的自动重试 Bean
+// (RetryScheduler) 由 km.retry.scheduler.enabled 控制是否创建。
+// 所以默认配置下这里什么也不会跑 —— 开关在配置里, 不在这里。
+@EnableScheduling
 @SpringBootApplication
 @MapperScan("com.km.task.mapper")
 public class TaskServiceApplication {

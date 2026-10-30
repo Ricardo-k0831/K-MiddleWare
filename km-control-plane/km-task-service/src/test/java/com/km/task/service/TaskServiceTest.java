@@ -337,6 +337,32 @@ class TaskServiceTest {
     }
 
     @Test
+    void 自动重试入口用SYSTEM_RETRY记录来源() {
+        AgentTask failed = task(TaskStatus.FAILED, TRACE_ID);
+        failed.setFinishedAt(LocalDateTime.now());
+        when(taskMapper.selectById(TASK_ID))
+                .thenReturn(failed, task(TaskStatus.PENDING, "新"));
+        when(attemptMapper.selectCount(any())).thenReturn(0L);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(attemptMapper.insert(any(AgentTaskAttempt.class))).thenReturn(1);
+
+        service.retry(TASK_ID, "自动重试", TaskEventSource.SYSTEM_RETRY);
+
+        ArgumentCaptor<AgentTaskEvent> eventCaptor =
+                ArgumentCaptor.forClass(AgentTaskEvent.class);
+        verify(eventMapper).insert(eventCaptor.capture());
+        // ★ 同一套原子动作, 来源不同 ★ 事后才能统计"系统兜底救回来多少"
+        assertEquals(TaskEventSource.SYSTEM_RETRY.name(), eventCaptor.getValue().getSource());
+
+        ArgumentCaptor<AuditEvent> auditCaptor = ArgumentCaptor.forClass(AuditEvent.class);
+        verify(audit).publish(auditCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> requestBody =
+                (Map<String, Object>) auditCaptor.getValue().requestBody();
+        assertEquals(TaskEventSource.SYSTEM_RETRY.name(), requestBody.get("source"));
+    }
+
+    @Test
     void 重试序号由retryCount推导_已重试两次时下一次是第4次() {
         AgentTask failed = task(TaskStatus.FAILED, TRACE_ID);
         failed.setRetryCount(2);

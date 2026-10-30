@@ -119,6 +119,8 @@ broker，实际上不行：Windows 上没有可用的 Python RocketMQ 客户端�
 
 > 2026-10-28 手动重试落地后，这个 1:N 是真的了：`create()` 生成第一次执行的
 > trace，`retry()` 每调用一次生成一条新链并插入一行新的 `agent_task_attempt`。
+> 2026-10-29 自动重试接上后，`retry()` 多了一个调用方，但生成 trace 的地方
+> 仍然只有这一个 —— Python 从不自己造 trace。
 > `agent_task.trace_id` 的语义固定为**最近一次执行**的 trace（滚动指针），
 > 权威来源是 `agent_task_attempt`。旧链不会失效于"时间"，而失效于
 > **任务表指针已经滚走**——拿旧 trace 进 `/chat` 或 PATCH 上报都会 409。
@@ -732,7 +734,9 @@ cd km-control-plane && mvn install
 #                      GuardedAttemptLookupTest             5   (500ms 截止 + 熔断)
 #                      AuditIngestAuthFilterTest            5   (认证边界)
 #                      AuditControllerTest                 10   (本项目第一个 web 测试)
-#                      TaskServiceTest                     14   (执行身份 + 溯源 + 重试)
+#                      TaskServiceTest                     15   (执行身份 + 溯源 + 重试两入口)
+#                      RetrySchedulerTest                   8   (退避 / 批次 / 租户灰度)
+#                      RetryDispatcherTest                  5   (payload + 失败分类)
 #                      ReportStatusRequestTest              3   (traceId 必填契约)
 
 cd km-agent-runtime && uv run pytest
@@ -909,15 +913,22 @@ AUDIT_INGEST_TOKEN=dev-audit-token-change-me
    没有依据去定那个数：得先有真实量级的分布，才谈得上"哪一层的哪些事件可以
    丢"。`LLM_CALL` 大概是最不能丢的——它贵，而且 token 数只有这一层有。
 
-6. **重试只做了手动 API，「任务 : 调用链 = 1:N」结构上通了，自动重试还没有。**
+6. **重试已从手动 API 走到自动调度，「任务 : 调用链 = 1:N」两条入口都在用了。**
    `POST /api/tasks/{id}/retry` 在一条事务里完成：CAS 更新任务（FAILED ->
    PENDING、换新 trace、`retry_count+1`、清掉上一轮的 `finished_at` /
    `error_msg` / `result`）、插入 `attempt_no+1` 的 RUNNING 记录、写事件、
    发审计。失败时 `retry_count >= max_retry` 或任务不是 FAILED 都返回 409。
 
-   自动重试（定时扫描 / 退避 / 失败后自动决定是否再试）**没有做**，因为它需要
-   Java → Python 的调度通道，而手动 API 是它的前置：先把"开新 attempt"做成
-   一个原子动作，以后无论是定时器还是 MQ 消费者来调，都只是多一个调用方。
+   2026-10-29 起，`RetryScheduler` 会定时扫描到期的 FAILED 任务，走**同一个**
+   `TaskService.retry(...)` 开新链，然后由 `RetryDispatcher` 调 Python `/chat`。
+   审计上的区别只有 `source`：手动 `JAVA_GATEWAY`，自动 `SYSTEM_RETRY`
+   （`reason="自动重试"`）。所以按 source 分组就能回答"多少任务是系统兜底
+   救回来的"，不用翻应用日志。
+
+   派发失败不是一律关链：**只有"确定没到达 Python"**（拒绝连接 / DNS / 连接
+   超时 / 线程池满）才回写 `PENDING -> FAILED`，detail 带 `phase=DISPATCH`；
+   读超时和 HTTP 5xx 时请求可能已经在跑，**只记日志**，否则会出现"任务失败
+   但 Python 继续上报"的双写。默认关闭、可按租户灰度（`km.retry.scheduler`）。
 
    `/chat` 入口现在核对的仍是 `agent_task.traceId`（当前执行的指针），这已经
    够了：重试和换指针在同一事务里，指针指向的 attempt 一定是开着的那条。另外

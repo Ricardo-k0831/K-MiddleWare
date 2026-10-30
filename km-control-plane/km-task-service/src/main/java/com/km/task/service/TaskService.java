@@ -280,7 +280,10 @@ public class TaskService {
     // ------------------------------------------------------------------
 
     /**
-     * 人工重试: 把一次 <b>FAILED</b> 的任务拉回 PENDING, 并开启它的下一代执行。
+     * 重试: 把一次 <b>FAILED</b> 的任务拉回 PENDING, 并开启它的下一代执行。
+     *
+     * <p>两个调用入口: {@code POST /api/tasks/{id}/retry} (人工, JAVA_GATEWAY)
+     * 与自动重试调度器 (SYSTEM_RETRY)。这里描述的是两者共用的原子动作。
      *
      * <h3>★ 重试不是一个状态, 是"换一条链重新排队" ★</h3>
      *
@@ -326,11 +329,36 @@ public class TaskService {
      * 上一轮的结果和错误并没有丢 —— 它们在事件表和审计里, 那才是历史,
      * 而任务表只记现在。
      *
+     * <h3>两个入口, 一份实现</h3>
+     *
+     * <p>手动重试 ({@code POST /api/tasks/{id}/retry}) 与自动重试
+     * ({@link com.km.task.retry.RetryScheduler}) 走的原子动作完全一样,
+     * 唯一的区别是审计里的 {@code source}: 前者是 {@code JAVA_GATEWAY}
+     * (有人/调用方显式发起), 后者是 {@code SYSTEM_RETRY} (系统按退避兜底)。
+     * 所以实现放在私有 {@code doRetry} 里, 两个 public 入口只负责带上 source ——
+     * 各自都带 {@code @Transactional}, 保证从外部进入时事务一定生效
+     * (类内 self-invocation 不会触发代理, 不能让 2 参入口去调 3 参入口)。
+     *
      * @param reason 可选的重试原因, 写进事件和审计; 便于事后回答"谁为什么又跑了一遍"
      * @return 更新后的任务 (含新的 traceId)
      */
     @Transactional
     public AgentTask retry(String agentTaskId, String reason) {
+        return doRetry(agentTaskId, reason, TaskEventSource.JAVA_GATEWAY);
+    }
+
+    /**
+     * 带来源的重试入口 —— 自动重试调度器用它传 {@link TaskEventSource#SYSTEM_RETRY}。
+     *
+     * <p>source 只影响"记成谁触发的", 不改变任何校验: 次数上限、状态边界、
+     * 并发 CAS 对两个入口一视同仁。否则"手动能多试几次"就会变成绕过上限的后门。
+     */
+    @Transactional
+    public AgentTask retry(String agentTaskId, String reason, TaskEventSource source) {
+        return doRetry(agentTaskId, reason, source);
+    }
+
+    private AgentTask doRetry(String agentTaskId, String reason, TaskEventSource source) {
         AgentTask task = requireTask(agentTaskId);
         TaskStatus from = parseStatus(task);
 
@@ -402,21 +430,20 @@ public class TaskService {
         attempt.setStatus(AgentTaskAttempt.RUNNING);
         attemptMapper.insert(attempt);
 
-        // (6) 事件: from 是 FAILED, to 是 PENDING, source 是 JAVA_GATEWAY。
+        // (6) 事件: from 是 FAILED, to 是 PENDING, source 由入口决定。
         //
-        //     ★ 为什么不是 SYSTEM_RETRY ★
-        //     这个接口是"人工/调用方显式发起"的一次重试; SYSTEM_RETRY 留给
-        //     将来的超时补偿/自动退避 —— 那时"谁触发的"才是系统。来源混用
-        //     的话, 事后统计"有多少任务是系统兜底救回来的"就查不出来了。
+        //     ★ 为什么 source 要区分 ★
+        //     手动重试 (JAVA_GATEWAY) 是"人工/调用方显式发起"; 自动重试
+        //     (SYSTEM_RETRY) 是"系统按退避兜底"。来源混用的话, 事后统计
+        //     "有多少任务是系统救回来的、又有多少是人在反复点"就查不出来了。
         //     状态机那条边本身与 source 无关, 受控性来自"只有 retry() 会调
-        //     isRetryAllowed", 不来自枚举值。
+        //     isRetryAllowed", 不来自枚举值 —— 所以两个入口共用同一套校验。
         Map<String, Object> detail = new LinkedHashMap<>();
         detail.put("attemptNo", nextAttemptNo);
         detail.put("traceId", newTraceId);
         putIfPresent(detail, "previousTraceId", previousTraceId);
         putIfPresent(detail, "reason", trimmedReason);
-        appendEvent(agentTaskId, from, TaskStatus.PENDING,
-                TaskEventSource.JAVA_GATEWAY, detail);
+        appendEvent(agentTaskId, from, TaskStatus.PENDING, source, detail);
 
         AgentTask updated = requireTask(agentTaskId);
 
@@ -434,14 +461,13 @@ public class TaskService {
                 // 发起者在当前的接口里没有身份信息 (还没有鉴权), 不编造。
                 .actor(updated.getUserId())
                 .status(AuditEvent.OK)
-                .requestBody(transitionRequest(from, TaskStatus.PENDING,
-                        TaskEventSource.JAVA_GATEWAY, detail))
+                .requestBody(transitionRequest(from, TaskStatus.PENDING, source, detail))
                 .responseBody(taskSnapshot(updated))
                 .build());
 
-        log.info("任务重试 task={} attemptNo={} newTrace={} previousTrace={} retryCount={}/{}",
+        log.info("任务重试 task={} attemptNo={} newTrace={} previousTrace={} retryCount={}/{} source={}",
                 agentTaskId, nextAttemptNo, newTraceId, previousTraceId,
-                retryCount + 1, maxRetry);
+                retryCount + 1, maxRetry, source);
         return updated;
     }
 
