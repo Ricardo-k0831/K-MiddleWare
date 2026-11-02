@@ -471,6 +471,85 @@ public class TaskService {
         return updated;
     }
 
+    // ------------------------------------------------------------------
+    //  心跳 —— "这次执行还活着"的证据
+    // ------------------------------------------------------------------
+
+    /**
+     * Python 运行时的心跳: 证明 {@code traceId} 这次执行仍在某处跑着。
+     *
+     * <h3>★ 心跳不是状态流转, 所以不写事件、不发审计 ★</h3>
+     *
+     * <p>事件表记的是"状态怎么变成的" (append-only 的业务事实)。心跳不改状态,
+     * 它只回答"这个进程还活着吗"。一次 Agent 执行可能有几十条心跳; 写进事件表
+     * 会把真正有价值的流转序列淹没 —— 而那张表恰恰是排查"卡在哪一步"的第一现场。
+     *
+     * <p>心跳只更新 attempt 上的 {@code last_heartbeat_at}, 一行 UPDATE,
+     * 不打审计。将来要统计"平均执行时长/心跳间隔"应当接指标系统 (Micrometer),
+     * 而不是把时间序列塞进审计表。
+     *
+     * <h3>校验顺序和 reportStatus 一致</h3>
+     *
+     * <p>先确认 trace 属于这个任务 (执行身份), 再确认这次执行还开着。
+     * 身份错了返回 409 而不是 200 —— 否则一条带错 trace 的心跳会悄悄把
+     * <b>别人的</b>执行续上, 而心跳的唯一作用恰恰是判断生死。
+     *
+     * <p>CAS 条件 {@code ended_at IS NULL} 挡住"读到还开着、写的时候已经闭链"
+     * 的竞争: 此时心跳没有意义 (执行已经结束), 返回 409 让 Python 停止心跳即可。
+     */
+    @Transactional
+    public void heartbeat(String agentTaskId, String traceId) {
+        // 先确认任务存在: 任务都不在的话 trace 的校验没有意义, 也给不出 404。
+        requireTask(agentTaskId);
+        AgentTaskAttempt attempt = requireAttempt(agentTaskId, traceId);
+
+        if (!attempt.isRunning()) {
+            throw new ExecutionMismatchException(agentTaskId, traceId,
+                    "该执行已于 " + attempt.getEndedAt() + " 结束, 不再接受心跳");
+        }
+        // 筛选出当前执行, 且 ended_at 为空的记录, 将其上一次心跳时间改为当前时间
+        int affected = attemptMapper.update(null,
+                Wrappers.<AgentTaskAttempt>lambdaUpdate()
+                        .eq(AgentTaskAttempt::getId, attempt.getId())
+                        .isNull(AgentTaskAttempt::getEndedAt)
+                        .set(AgentTaskAttempt::getLastHeartbeatAt, LocalDateTime.now()));
+
+        if (affected == 0) {
+            // 读到写之间这条执行刚刚闭链 (终态上报赢了)。这不是故障, 是竞争,
+            // 但必须让调用方知道"别再给我发心跳了"。
+            throw new ExecutionMismatchException(agentTaskId, traceId,
+                    "该执行刚刚结束, 心跳未被记录");
+        }
+    }
+
+    /**
+     * 记录"Java 已经把这次执行派发到 Python"。
+     *
+     * <p>由 {@link com.km.task.retry.RetryDispatcher} 在发 {@code /chat}
+     * <b>之前</b>调用。它本身不改变任务状态, 只是给心跳兜底扫描器一个许可:
+     * <b>从这一刻起, 这次执行如果长时间没有任何心跳, 就值得去探活。</b>
+     *
+     * <p>为什么必须单独记一次: 新建的任务合法地停在 PENDING 等调用方来跑,
+     * 仅凭 {@code started_at} 的年龄无法区分"还没人发起"和"发起了但丢了"。
+     * 没有这个标记, 兜底扫描要么误杀正常等待的任务, 要么对丢派发完全无感。
+     *
+     * <p>失败 (数据库抖一下) 只影响这次执行能否被兜底扫到, 不影响派发本身,
+     * 所以调用方应当吞掉异常继续发请求 —— 见 RetryDispatcher。
+     *
+     * @return true = 标记成功; false = 这次执行在标记前已经闭链 (理论上不该发生)
+     */
+    @Transactional
+    // 在校验表attempt里更新 dispatched_at 字段, 记录当前执行被 chat()接口 接收的时间
+    public boolean markDispatched(String agentTaskId, String traceId) {
+        AgentTaskAttempt attempt = requireAttempt(agentTaskId, traceId);
+        int affected = attemptMapper.update(null,
+                Wrappers.<AgentTaskAttempt>lambdaUpdate()
+                        .eq(AgentTaskAttempt::getId, attempt.getId())
+                        .isNull(AgentTaskAttempt::getEndedAt)
+                        .set(AgentTaskAttempt::getDispatchedAt, LocalDateTime.now()));
+        return affected > 0;
+    }
+
     /**
      * 这个任务下是否有未闭链的执行。
      *

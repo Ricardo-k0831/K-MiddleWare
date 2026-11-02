@@ -4,6 +4,7 @@ import com.km.task.domain.AgentTask;
 import com.km.task.domain.AgentTaskEvent;
 import com.km.task.service.TaskService;
 import com.km.task.web.dto.CreateTaskRequest;
+import com.km.task.web.dto.HeartbeatRequest;
 import com.km.task.web.dto.ReportStatusRequest;
 import com.km.task.web.dto.RetryTaskRequest;
 import jakarta.validation.Valid;
@@ -28,7 +29,11 @@ import java.util.List;
  *   GET    /api/tasks/{id}/events      状态流转历史      -> 200 / 404
  *   PATCH  /api/tasks/{id}/status      状态上报          -> 200 / 400 / 404 / 409
  *   POST   /api/tasks/{id}/retry       失败任务重试      -> 200 / 404 / 409
+ *   POST   /api/tasks/{id}/heartbeat   执行心跳          -> 204 / 400 / 404 / 409
  * </pre>
+ *
+ * <p>心跳和状态上报是两个动作, 所以是两个接口: 心跳不改状态、不写事件,
+ * 它只回答"这次执行还活着吗" (见 {@link TaskService#heartbeat})。
  *
  * <p>PATCH 的 409 有两种含义, 用错误码区分: {@code ILLEGAL_TRANSITION}
  * (状态不能这么变) 和 {@code EXECUTION_MISMATCH} (traceId 不属于这个任务)。
@@ -108,5 +113,19 @@ public class TaskController {
     public AgentTask retry(@PathVariable String agentTaskId,
                            @Valid @RequestBody(required = false) RetryTaskRequest request) {
         return taskService.retry(agentTaskId, request == null ? null : request.reason());
+    }
+
+    /**
+     * 执行心跳。Python 运行时在执行期间定时调用。
+     *
+     * <p>返回 204 而不是回任务快照: 心跳是高频旁路 (默认 15s 一次),
+     * 调用方不需要任何返回值 —— 它只会看状态码来决定"要不要继续跳"。
+     * 4xx 的含义是"别跳了" (trace 不对 / 执行已结束), 不是"重试一下"。
+     */
+    @PostMapping("/{agentTaskId}/heartbeat")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void heartbeat(@PathVariable String agentTaskId,
+                          @Valid @RequestBody HeartbeatRequest request) {
+        taskService.heartbeat(agentTaskId, request.traceId());
     }
 }

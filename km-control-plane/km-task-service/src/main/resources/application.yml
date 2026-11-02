@@ -92,6 +92,30 @@ km:
       concurrency: ${KM_RETRY_CONCURRENCY:2}
       queue-capacity: ${KM_RETRY_QUEUE_CAPACITY:100}
 
+  # 心跳兜底 (见 com.km.task.heartbeat) —— 处理"派发出去后再没消息"的执行。
+  #
+  # ★ 默认关闭 ★ 它会自己把任务判死 (进而触发自动重试, 花钱), 打开是显式决定:
+  #   KM_HEARTBEAT_ENABLED=true mvn spring-boot:run
+  #
+  # 心跳协议:
+  #   Python 执行期间每 15s POST /api/tasks/{id}/heartbeat {"traceId": ...}
+  #   Java 发现心跳/派发证据过期 (默认 120s) 后 GET {probe-url}/tasks/{trace}/alive
+  #   只有 Python 明确回答 alive=false 才关链; 问不出来就继续等。
+  heartbeat:
+    enabled: ${KM_HEARTBEAT_ENABLED:false}
+    # 多久检查一次。只影响发现延迟, 不影响判定阈值。
+    interval-ms: ${KM_HEARTBEAT_INTERVAL_MS:15000}
+    # 必须远大于 Python 侧的心跳间隔 (km-agent-runtime 里 heartbeat_interval_seconds),
+    # 丢一两个心跳不该触发探活, 更不能触发关链。
+    stale-after-seconds: ${KM_HEARTBEAT_STALE_AFTER_SECONDS:120}
+    batch-size: ${KM_HEARTBEAT_BATCH_SIZE:20}
+    # 租户灰度; 空 = 全部。先在一个租户上观察误判率再放开。
+    tenant: ${KM_HEARTBEAT_TENANT:}
+    # 探活地址: 和派发同一个 Python 运行时, 所以复用 KM_PYTHON_CHAT_URL。
+    probe-url: ${KM_PYTHON_CHAT_URL:http://localhost:8000}
+    probe-connect-timeout-seconds: ${KM_HEARTBEAT_PROBE_CONNECT_TIMEOUT_SECONDS:3}
+    probe-timeout-seconds: ${KM_HEARTBEAT_PROBE_TIMEOUT_SECONDS:5}
+
 logging:
   level:
     com.km.task: DEBUG

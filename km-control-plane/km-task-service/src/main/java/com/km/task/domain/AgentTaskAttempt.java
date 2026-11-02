@@ -64,6 +64,32 @@ public class AgentTaskAttempt {
     /** NULL = 还在跑。闭链后不再接受这次执行的状态上报。 */
     private LocalDateTime endedAt;
 
+    /**
+     * Java 把 {@code /chat} 发出去的时点。NULL = 还没派发。
+     *
+     * <p>心跳兜底 (见 {@code com.km.task.heartbeat}) 用它回答一个问题:
+     * <b>这次执行到底有没有人负责跑?</b>
+     *
+     * <p>不能拿 {@code started_at} 当这个证据: attempt 是"开新链"时创建的,
+     * 而首次执行由调用方自己调 {@code /chat}, 任务建好后可能合法地停在
+     * PENDING 很久。只看年龄的话, 扫描器会把"还在等调用方"误判成"卡住了"。
+     * 所以只有两种证据算数: Java 派发过 ({@code dispatched_at}) 或 Python
+     * 跑起来过 ({@code lastHeartbeatAt})。
+     */
+    private LocalDateTime dispatchedAt;
+
+    /**
+     * 最近一次心跳。NULL = 这次执行从来没跑起来。
+     *
+     * <p>写在 attempt 而不是 agent_task 上: 心跳是<b>一次执行</b>的属性,
+     * 重试会换一条链, 旧链的心跳不该刷新新链的时钟。
+     *
+     * <p>它只证明"Python 进程里这个 trace 还活着", <b>不</b>直接给关闭链路
+     * 授权 —— 时间戳陈旧可能只是这台 Java 收不到心跳。真正能关链的证据是
+     * 主动探活得到 {@code alive=false}, 见 HeartbeatSweeper。
+     */
+    private LocalDateTime lastHeartbeatAt;
+
     /** 这次执行是否还活着。判断用 endedAt 而不是 status, 避免两列不一致。 */
     public boolean isRunning() {
         return endedAt == null;
@@ -123,5 +149,21 @@ public class AgentTaskAttempt {
 
     public void setEndedAt(LocalDateTime endedAt) {
         this.endedAt = endedAt;
+    }
+
+    public LocalDateTime getDispatchedAt() {
+        return dispatchedAt;
+    }
+
+    public void setDispatchedAt(LocalDateTime dispatchedAt) {
+        this.dispatchedAt = dispatchedAt;
+    }
+
+    public LocalDateTime getLastHeartbeatAt() {
+        return lastHeartbeatAt;
+    }
+
+    public void setLastHeartbeatAt(LocalDateTime lastHeartbeatAt) {
+        this.lastHeartbeatAt = lastHeartbeatAt;
     }
 }

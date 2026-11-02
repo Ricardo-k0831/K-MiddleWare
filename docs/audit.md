@@ -946,3 +946,30 @@ AUDIT_INGEST_TOKEN=dev-audit-token-change-me
    压测之后应当外置到 `km.audit.ingest`。另外正缓存 60 秒意味着**迟到识别最
    多会晚一分钟**——迟到事件本身不会丢，只是 `late` 计数晚一点才准。
 
+9. **心跳兜底上线（2026-10-31），多了一个 `SYSTEM_HEARTBEAT` 来源。**
+   自动重试只扫 FAILED，看不到"派发出去后再没消息"的任务。新的
+   `HeartbeatSweeper` 会找出证据（`last_heartbeat_at` / `dispatched_at`）过期
+   的执行，再 **`GET {python}/tasks/{trace}/alive`** 反向确认；只有 Python
+   明确回答 `alive=false` 才把它关成 FAILED —— 问不出来（404 / 5xx / 连不上）
+   一律当未知，什么都不做。
+
+   审计上要区分两件事：`SYSTEM_RETRY` 回答"失败后是谁重试的"，
+   `SYSTEM_HEARTBEAT` 回答"是谁发现这次执行其实早就没了"。所以关链那条
+   事件的 `source=SYSTEM_HEARTBEAT`，`detail.phase=HEARTBEAT`，带着
+   `previousStatus` / `lastEvidenceAt` / `staleForSeconds` / `dispatchedAt`；
+   随后的重试仍是 `SYSTEM_RETRY`。按 source 分组就能算出
+   "有多少任务是心跳兜底救回来的"，再和历史失败率对比。
+
+   **心跳本身不写事件、不发审计**：它是存活证据，不是状态迁移。每 15 秒一条
+   事件会把事件表刷成心跳日志，真正要看的变迁反而被埋掉。所以
+   `POST /api/tasks/{id}/heartbeat` 只更新 `last_heartbeat_at`。
+
+   同一批数据里的一个新约束：`agent_task_event.source` 现在有四个取值
+   （`JAVA_GATEWAY` / `PYTHON_RUNTIME` / `SYSTEM_RETRY` / `SYSTEM_HEARTBEAT`），
+   任何按 source 白名单过滤的查询都要跟着改。
+
+   回归防线：`HeartbeatProbeTest`（6）+ `HeartbeatSweeperTest`（11）+
+   `TaskServiceTest` 心跳/派发标记 6 条 + `tests/test_heartbeat.py`（15）+
+   `tests/test_chat_task_wiring.py` 心跳接线 6 条 +
+   `scripts/verify_heartbeat_sweep.py`（32 项断言，实测 32/32）。
+

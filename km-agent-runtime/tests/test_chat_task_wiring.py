@@ -39,6 +39,7 @@ from langchain_core.outputs import ChatGeneration, LLMResult
 
 import app.main as main_module
 from app.audit import AuditReporter
+from app.heartbeat import HeartbeatBeater
 from app.mcp_adapter.task_identity import TaskIdentity, current_task_identity
 from app.task_state import (
     COMPLETED,
@@ -66,10 +67,16 @@ class FakeJava:
     def __init__(self) -> None:
         self.status_reports: list[dict] = []
         self.audit_batches: list[list[dict]] = []
+        # 心跳单独记一条队列。它和状态上报打的是同一个 base_url, 报文却只有
+        # 一个 traceId —— 混进 status_reports 的话, statuses() 会读到 KeyError
+        # 或者把一条心跳当成状态变更, 失败信息会指向根本不存在的 bug。
+        self.heartbeats: list[dict] = []
         # 建出来的审计 Reporter。挂在 fake 上而不是由 fixture 多返回一个值,
         # 是为了让原来那些 `fake, created = wired` 一行都不用改 ——
         # 一个纯新增的旁路不该逼着所有老测试改签名。
         self.audit_reporters: list[AuditReporter] = []
+        # 同理, 心跳也是第三条旁路: 也挂在 fake 上, 不改 yield 的形状。
+        self.beaters: list[HeartbeatBeater] = []
 
     def transport(self) -> httpx.MockTransport:
         def handle(request: httpx.Request) -> httpx.Response:
@@ -80,6 +87,10 @@ class FakeJava:
                 return httpx.Response(
                     202, json={"accepted": len(body), "received": len(body)}
                 )
+            if request.url.path.endswith("/heartbeat"):
+                self.heartbeats.append(body)
+                # 真实接口是 204 无响应体 (见 TaskController.heartbeat)
+                return httpx.Response(204)
             self.status_reports.append(body)
             return httpx.Response(200, json={"ok": True})
 
@@ -207,8 +218,31 @@ def wired(monkeypatch):
             await super().aclose(drain_timeout)
             self.aclosed = True
 
+    class RecordingBeater(HeartbeatBeater):
+        """真 Beater + 假网络。断言打在实际发出的心跳报文和 aclose 上。
+
+        必须继承真类: "心跳有没有发出去"和"收尾有没有停"是这条旁路的全部内容,
+        mock 掉整个类的话这两个断言都成了空话 (和状态上报那条一个道理)。
+        """
+
+        def __init__(
+            self, base_url: str, task_id: str, *, trace_id: str,
+            interval: float = 15.0, timeout: float = 2.0,
+        ) -> None:
+            super().__init__(
+                base_url, task_id, trace_id=trace_id, interval=interval,
+                timeout=timeout, client=httpx.AsyncClient(transport=fake.transport()),
+            )
+            self.aclosed = False
+            fake.beaters.append(self)
+
+        async def aclose(self) -> None:
+            await super().aclose()
+            self.aclosed = True
+
     monkeypatch.setattr(main_module, "TaskStateReporter", RecordingReporter)
     monkeypatch.setattr(main_module, "AuditReporter", RecordingAuditReporter)
+    monkeypatch.setattr(main_module, "HeartbeatBeater", RecordingBeater)
 
     # 入口的执行身份校验 (GET /api/tasks/{id}) 在 test_task_entry_validation.py
     # 里单独验, 那里用 MockTransport 造了任务服务的响应。这里换成放行版 ——
@@ -228,6 +262,8 @@ def wired(monkeypatch):
         asyncio.run(reporter._client.aclose())
     for reporter in fake.audit_reporters:
         asyncio.run(reporter._client.aclose())
+    for beater in fake.beaters:
+        asyncio.run(beater._client.aclose())
 
 
 def post_chat(agent: FakeAgent, body: dict) -> httpx.Response:
@@ -676,3 +712,95 @@ def test_上一次的身份不会泄漏到下一次请求(wired):
     assert resp.status_code == 200
     assert agent.seen[0] == TaskIdentity(task_id=TASK_ID, trace_id=TRACE_ID)
     assert agent.seen[-1] is None, "上一个任务的身份泄漏到了下一个请求"
+
+
+# ----------------------------------------------------------------------
+#  心跳 —— 第三条旁路 (Java 侧"卡住的 PENDING"兜底的另一半)
+# ----------------------------------------------------------------------
+#
+#  两件事必须同时成立, 少一件兜底就是坏的:
+#
+#  1. push 方向: 执行期间真的在给 Java 发心跳。不发的话, 每一个正常任务
+#     都会被 Java 的心跳兜底当成可疑对象去探活 —— 功能不坏, 但每 15 秒
+#     一次探活请求, 全量任务都在付这个成本。
+#  2. pull 方向: 执行期间 /alive 必须答 true, 执行结束后必须答 false,
+#     而且【排空之后】才答 false。早答一秒 = Java 提前关链 + 终态上报 409。
+
+
+class LivenessAwareAgent(FakeAgent):
+    """在 ainvoke 内部读一次存活登记 —— 这正是 Java 探活会看到的时刻。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.alive_during_run: list[bool] = []
+
+    async def ainvoke(self, payload: dict, config: dict | None = None) -> dict:
+        self.alive_during_run.append(main_module.LIVENESS.is_alive(TRACE_ID))
+        return await super().ainvoke(payload, config)
+
+
+def test_带task_id时执行期间会发心跳(wired):
+    fake, _ = wired
+    post_chat(FakeAgent(), {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert fake.heartbeats, "一次心跳都没发 —— 正常任务会被当成可疑对象反复探活"
+    # 心跳必须标明是哪一次执行。没有 traceId 的话 Java 只能去猜, 猜错的
+    # 后果是给【别的执行】续命。
+    assert all(hb["traceId"] == TRACE_ID for hb in fake.heartbeats)
+
+
+def test_不带task_id时既不建心跳也不发心跳(wired):
+    fake, _ = wired
+    post_chat(FakeAgent(), {"message": "你好"})
+
+    assert fake.beaters == [], "没给 task_id 却建了心跳 —— Phase1 路径被污染了"
+    assert fake.heartbeats == []
+
+
+def test_请求结束时心跳被停掉(wired):
+    """不停的话, 每条请求都会留下一个每 15 秒打一次 Java 的后台协程。"""
+    fake, _ = wired
+    post_chat(FakeAgent(), {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert len(fake.beaters) == 1
+    assert fake.beaters[0].aclosed, "心跳协程没停, 请求结束后还在打 Java"
+
+
+def test_失败路径也会停掉心跳(wired):
+    fake, _ = wired
+    resp = post_chat(
+        FakeAgent(raise_exc=RuntimeError("boom")),
+        {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID},
+    )
+
+    assert resp.status_code == 500
+    assert fake.beaters and fake.beaters[0].aclosed, "失败路径漏停了心跳"
+
+
+def test_执行期间探活回答alive_结束后回答false(wired):
+    """★ 两个时刻一起验, 单看哪一个都发现不了错位 ★
+
+    只看"执行期间是 true", 那么收尾忘了解除登记也能通过 —— 后果是这条
+    执行永远活着, 一旦真死了 Java 也关不掉它。
+    """
+    agent = LivenessAwareAgent()
+    post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert agent.alive_during_run == [True], "执行期间 Java 探活会得到 false, 任务被误杀"
+    assert not main_module.LIVENESS.is_alive(TRACE_ID), "请求结束后存活登记没撤销"
+
+
+def test_入口校验失败时既不发心跳也不留存活登记(wired):
+    """存活登记在校验【之前】做 —— 那么校验失败时必须有人负责撤销。
+
+    不撤销的话, Python 会一直对这条 trace 答 alive: Java 的心跳兜底永远
+    关不掉它, 表现是一条卡了几天的 PENDING 任务, 而 Python 日志里什么都没有。
+    """
+    fake, created = wired
+    resp = post_chat(FakeAgent(), {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID + "-wrong"})
+
+    assert resp.status_code == 409
+    assert fake.beaters == [], "校验没过却已经把心跳跑起来了"
+    assert fake.heartbeats == []
+    assert created == []
+    assert not main_module.LIVENESS.is_alive(TRACE_ID + "-wrong"), "失败的请求在存活登记里留下了残留"

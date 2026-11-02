@@ -1,9 +1,10 @@
 """FastAPI 入口。
 
 对外提供:
-    GET  /health        存活检查
-    GET  /agent/tools   ★ 列出 Agent 实际拿到的工具 —— 这是验证 MCP 握手的手段
-    POST /chat          跑一轮 Agent
+    GET  /health                存活检查
+    GET  /agent/tools           ★ 列出 Agent 实际拿到的工具 —— 这是验证 MCP 握手的手段
+    GET  /tasks/{trace}/alive   ★ 执行存活探活 —— Java 心跳兜底关链前的最后一问
+    POST /chat                  跑一轮 Agent
 
 启动顺序上有个关键点: 工具拉取放在 lifespan 里, 而不是每个请求里。
 MCP 握手和 tools/list 是有成本的, 每轮对话重来一次会让响应变慢,
@@ -25,6 +26,7 @@ from pydantic import BaseModel, Field
 from app.audit import AuditCallbackHandler, AuditReporter
 from app.config import get_settings
 from app.graph.agent import build_agent
+from app.heartbeat import HeartbeatBeater, LivenessRegistry
 from app.mcp_adapter import TaskIdentity, ToolProvider, build_tool_provider, task_identity
 from app.task_state import (
     CANCELLED,
@@ -75,6 +77,13 @@ class AppState:
 
 
 state = AppState()
+
+# 本进程正在执行哪些 trace。模块级单例, 因为 /alive 和 /chat 是两个
+# 请求处理函数, 必须看到同一份清单。
+#
+# 放在模块级还带来一个测试上的好处: 测试可以直接问 LIVENESS, 而不必
+# 通过 HTTP 绕一圈。见 tests/test_heartbeat.py。
+LIVENESS = LivenessRegistry()
 
 
 @asynccontextmanager
@@ -221,6 +230,30 @@ async def list_agent_tools() -> dict[str, Any]:
         "tools": [
             {"name": t.name, "description": t.description} for t in tools
         ],
+    }
+
+
+@app.get("/tasks/{trace_id}/alive")
+async def task_alive(trace_id: str) -> dict[str, Any]:
+    """探活: 本进程还在跑这条 trace 吗?
+
+    ★ 这个回答会被 Java 用来决定"要不要把任务判死" ★ 所以语义必须窄:
+    只有本进程**当前确实有**这个 trace 在执行时才返回 true。
+
+    登记 / 注销的时机 (见 chat):
+
+    * 在入口身份校验**之前**登记 —— 探活要覆盖"正在校验身份"的窗口,
+      否则校验稍慢就会被误判成没在跑。
+    * 在终态上报排空**之后**注销 —— 反过来 (先注销再排空) 会制造一个
+      危险的窗口: 探活说 false, Java 关链, 紧接着终态上报到达却被 409 拒掉。
+
+    前提是单实例, 见 app/heartbeat.py 的模块注释。
+    """
+    elapsed = LIVENESS.elapsed_seconds(trace_id)
+    return {
+        "alive": elapsed is not None,
+        "trace_id": trace_id,
+        "elapsed_seconds": elapsed,
     }
 
 
@@ -379,149 +412,183 @@ async def chat(req: ChatRequest) -> ChatResponse:
     task_id = (req.task_id or "").strip() or None
     trace_id = (req.trace_id or "").strip() or None
 
-    if task_id is not None:
-        # ★ 任务链路必须带 trace_id ★
-        # 不带的话, Java 只能拿"任务表上最近一次执行"去猜。猜错不会报错,
-        # 只会让这次运行的每一条审计挂到别的执行/别的任务名下。宁可 400。
-        if trace_id is None:
-            raise HTTPException(
-                status_code=400,
-                detail="带 task_id 时必须同时带 trace_id (来自任务创建响应)",
-            )
-        # ★ 入口校验, 失败即止 ★ —— 在拉起任何上报器、跑任何 LLM 之前。
-        await _verify_task_identity(settings, task_id, trace_id)
-
-    # 从传入的请求中获取任务身份
-    # 任务身份的作用: 让 Java 网关知道接下来的工具调用属于哪个任务。
-    # 只在任务链路下绑 —— 不带 task_id 的调用没有身份可绑, 走匿名。
-    identity = (
-        TaskIdentity(
-            task_id=task_id,
-            trace_id=trace_id,
-            tenant_id=(req.tenant_id or "").strip() or None,
-            actor=(req.actor or "").strip() or None,
-        )
-        if task_id is not None
-        else None
-    )
-
     reporter: TaskStateReporter | None = None
     audit: AuditReporter | None = None
-
+    beater: HeartbeatBeater | None = None
+    identity: TaskIdentity | None = None
     # 回调函数列表, 用于在任务链路下的状态上报和审计上报
     callbacks: list[Any] = []
+    liveness_registered = False
 
-    if task_id is not None:
-        reporter = TaskStateReporter(
-            settings.km_task_service_url,
-            task_id,
-            # trace_id 是执行身份: Java 用它找 agent_task_attempt,
-            # 缺了它整条上报会被拒 —— 上面入口已经确保了它非空。
-            trace_id=trace_id,
-            timeout=settings.km_task_service_timeout_seconds,
-        )
-        await reporter.start()
-        # 入口就报 THINKING: 这样即使 LLM 一次都没调起来 (直接抛错),
-        # 事件表里也留下了"任务开始跑过"的痕迹, 而不是一条都没有。
-        # 之后 on_llm_start 再报一次 THINKING 是幂等的, Java 不写重复事件。
-        reporter.report(THINKING, {"phase": "entry"})
-        callbacks.append(TaskStateCallbackHandler(reporter))
-
-        # 审计是第二条旁路, 和状态上报并列 —— 两者都在任务链路下才建,
-        # 不带 task_id 的调用一条外部请求都不发 (有测试钉着这一点)。
-        #
-        # ★ 为什么审计只在任务链路下开 ★
-        #
-        # 因为【审计的每条记录都要能归属到一个任务】。没有 task_id 的调用
-        # 记出来是一堆查不到一起的匿名行 —— 那种数据不是"少", 是"没法用",
-        # 还会把审计表的信噪比拉低。宁可没有, 也不要一堆解释不了的行。
-        audit = AuditReporter(
-            settings.km_task_service_url,
-            task_id=task_id,
-            # 身份原样透传, 一个都不补 —— 理由见 ChatRequest.trace_id 那段
-            trace_id=identity.trace_id if identity is not None else None,
-            tenant_id=identity.tenant_id if identity is not None else None,
-            actor=identity.actor if identity is not None else None,
-            # 服务间认证: 和 Java 侧 km.audit.ingest.token 必须一致, 否则
-            # /api/audit/events 回 401, 表现是"审计一条都没有"。
-            token=settings.audit_ingest_token,
-            timeout=settings.km_task_service_timeout_seconds,
-        )
-        await audit.start()
-        # 审计上报回调函数, 用于在任务链路下的审计上报
-        callbacks.append(AuditCallbackHandler(audit, default_model=settings.llm_model))
-
-    # 任务链路下 task_id 同时就是 LangGraph 的 thread_id —— 两者本来就是
-    # 同一个东西 ("这单业务"和"这张图跑到哪了"), 共用一个 ID 让断点续跑
-    # 不需要任何映射表。见 AgentTask 的类注释。
+    # ★ 最外层 try/finally 只负责两件收尾: 停心跳、注销存活登记 ★
     #
-    # ★ 代价: 对话记忆是按【任务】隔离的, 不是按【会话】★
-    # 同一个 session 里连问两件事 = 两个 task = 两个 thread, 第二个任务
-    # 看不见第一个任务的上下文。现在的"会话"只有 agent_task.session_id
-    # 这个数据库标签, 运行时并不认识它。
-    # 要做到会话级记忆, thread_id 应当是 session_id, 用 LangGraph 的
-    # checkpoint_ns 区分任务 —— 那是 Phase 2 的事。这里写清楚, 是为了
-    # 避免误以为"同一会话的多个任务共享记忆"而按这个前提去设计功能。
-    thread_id = task_id or req.thread_id
-    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-    if callbacks:
-        config["callbacks"] = callbacks
-
+    # 为什么连"身份校验失败"也要被它包住: 存活登记发生在身份校验【之前】
+    # (理由见 task_alive)。如果不包, 一次 409 的请求会让 LIVENESS 里
+    # 永远留着这个 trace —— 之后 Java 探活会一直听到 "alive",
+    # 一条其实没在跑的任务就永远关不掉。
     try:
-        # ★ 身份的作用域要【恰好】包住这次 invocation ★
-        #
-        # 往小了说: 不包的话, 这一轮里所有工具调用都会匿名 —— 网关收不到
-        # X-KM-Task-Id, 审计里的 agent_task_id 全是 NULL。
-        #
-        # 往大了说: 包住整个请求处理 (或者干脆不还原) 的话, 并发请求之间
-        # 会串号 —— 而且串得毫无规律, 只在压测时才看得出来。
-        # contextvars 保证了这里按任务隔离, `with` 保证出了块就还原。
-        #
-        # Agent 内部对工具调用的调度 (LangGraph 的 ReAct 循环、它起的
-        # 子任务) 都在这个块里, ContextVar 会自动传播进去, 不需要把身份
-        # 当参数一层层往下传。
-        with task_identity(identity):
-            result = await state.agent.ainvoke(
-                {"messages": [{"role": "user", "content": req.message}]},
-                config=config,
+        if task_id is not None:
+            # ★ 任务链路必须带 trace_id ★
+            # 不带的话, Java 只能拿"任务表上最近一次执行"去猜。猜错不会报错,
+            # 只会让这次运行的每一条审计挂到别的执行/别的任务名下。宁可 400。
+            if trace_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="带 task_id 时必须同时带 trace_id (来自任务创建响应)",
+                )
+
+            # ★ 先登记存活, 再做入口校验 ★
+            # 探活要覆盖"正在校验身份"的窗口; 反过来 (校验完再登记) 的话,
+            # 校验一慢, Java 就会看到 alive=false 而误关链路。
+            LIVENESS.register(trace_id)
+            liveness_registered = True
+
+            # ★ 入口校验, 失败即止 ★ —— 在拉起任何上报器、跑任何 LLM 之前。
+            await _verify_task_identity(settings, task_id, trace_id)
+
+            # 从传入的请求中获取任务身份
+            # 任务身份的作用: 让 Java 网关知道接下来的工具调用属于哪个任务。
+            identity = TaskIdentity(
+                task_id=task_id,
+                trace_id=trace_id,
+                tenant_id=(req.tenant_id or "").strip() or None,
+                actor=(req.actor or "").strip() or None,
             )
 
-        # ReAct 循环产出的最后一条消息就是最终答复
-        messages = result.get("messages", [])
-        reply = messages[-1].content if messages else ""
+            reporter = TaskStateReporter(
+                settings.km_task_service_url,
+                task_id,
+                # trace_id 是执行身份: Java 用它找 agent_task_attempt,
+                # 缺了它整条上报会被拒 —— 上面入口已经确保了它非空。
+                trace_id=trace_id,
+                timeout=settings.km_task_service_timeout_seconds,
+            )
+            await reporter.start()
+            # 入口就报 THINKING: 这样即使 LLM 一次都没调起来 (直接抛错),
+            # 事件表里也留下了"任务开始跑过"的痕迹, 而不是一条都没有。
+            # 之后 on_llm_start 再报一次 THINKING 是幂等的, Java 不写重复事件。
+            reporter.report(THINKING, {"phase": "entry"})
+            callbacks.append(TaskStateCallbackHandler(reporter))
 
-        # 把整轮里所有 AIMessage 的 tool_calls 按顺序收集起来。
-        # 注意是从【整个 messages 列表】扫, 不是只看最后一条 ——
-        # ReAct 可能有多轮工具调用, 最后一条通常已经没有 tool_calls 了。
-        tool_calls: list[str] = []
-        for msg in messages:
-            for call in getattr(msg, "tool_calls", None) or []:
-                name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
-                if name:
-                    tool_calls.append(name)
+            # 审计是第二条旁路, 和状态上报并列 —— 两者都在任务链路下才建,
+            # 不带 task_id 的调用一条外部请求都不发 (有测试钉着这一点)。
+            #
+            # ★ 为什么审计只在任务链路下开 ★
+            #
+            # 因为【审计的每条记录都要能归属到一个任务】。没有 task_id 的调用
+            # 记出来是一堆查不到一起的匿名行 —— 那种数据不是"少", 是"没法用",
+            # 还会把审计表的信噪比拉低。宁可没有, 也不要一堆解释不了的行。
+            audit = AuditReporter(
+                settings.km_task_service_url,
+                task_id=task_id,
+                # 身份原样透传, 一个都不补 —— 理由见 ChatRequest.trace_id 那段
+                trace_id=identity.trace_id,
+                tenant_id=identity.tenant_id,
+                actor=identity.actor,
+                # 服务间认证: 和 Java 侧 km.audit.ingest.token 必须一致, 否则
+                # /api/audit/events 回 401, 表现是"审计一条都没有"。
+                token=settings.audit_ingest_token,
+                timeout=settings.km_task_service_timeout_seconds,
+            )
+            await audit.start()
+            # 审计上报回调函数, 用于在任务链路下的审计上报
+            callbacks.append(AuditCallbackHandler(audit, default_model=settings.llm_model))
 
-        # ★ 终态由这里报, 不由 CallbackHandler 报 ★
-        # 只有这里知道这轮 invocation 到底成没成。工具报错【不】代表任务失败 ——
-        # ReAct 循环存在的意义就是从工具错误里恢复。详见 app/task_state.py
-        # 里那段 ★ 注释, 那里记着把它映射成 FAILED 会怎样永久毁掉一个成功的任务。
-        if reporter is not None:
-            reporter.report(COMPLETED, {"result": reply})
+            # 第三条旁路: 心跳。它的存在是为了让 Java 的"卡住的执行"兜底
+            # 不在正常执行上浪费探活 —— 心跳正常的任务根本不会进入可疑集合。
+            # 和另外两条一样: 只上报, 失败不影响主流程。
+            beater = HeartbeatBeater(
+                settings.km_task_service_url,
+                task_id,
+                trace_id=trace_id,
+                interval=settings.heartbeat_interval_seconds,
+                timeout=settings.km_task_service_timeout_seconds,
+            )
+            await beater.start()
 
-    except Exception as ex:
-        logger.exception("Agent 执行失败")
-        if reporter is not None:
-            reporter.report(FAILED, {"error": describe_exception(ex)})
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent 执行失败: {describe_exception(ex)}",
-        ) from ex
+        # 任务链路下 task_id 同时就是 LangGraph 的 thread_id —— 两者本来就是
+        # 同一个东西 ("这单业务"和"这张图跑到哪了"), 共用一个 ID 让断点续跑
+        # 不需要任何映射表。见 AgentTask 的类注释。
+        #
+        # ★ 代价: 对话记忆是按【任务】隔离的, 不是按【会话】★
+        # 同一个 session 里连问两件事 = 两个 task = 两个 thread, 第二个任务
+        # 看不见第一个任务的上下文。现在的"会话"只有 agent_task.session_id
+        # 这个数据库标签, 运行时并不认识它。
+        # 要做到会话级记忆, thread_id 应当是 session_id, 用 LangGraph 的
+        # checkpoint_ns 区分任务 —— 那是 Phase 2 的事。这里写清楚, 是为了
+        # 避免误以为"同一会话的多个任务共享记忆"而按这个前提去设计功能。
+        thread_id = task_id or req.thread_id
+        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+        if callbacks:
+            config["callbacks"] = callbacks
+
+        try:
+            # ★ 身份的作用域要【恰好】包住这次 invocation ★
+            #
+            # 往小了说: 不包的话, 这一轮里所有工具调用都会匿名 —— 网关收不到
+            # X-KM-Task-Id, 审计里的 agent_task_id 全是 NULL。
+            #
+            # 往大了说: 包住整个请求处理 (或者干脆不还原) 的话, 并发请求之间
+            # 会串号 —— 而且串得毫无规律, 只在压测时才看得出来。
+            # contextvars 保证了这里按任务隔离, `with` 保证出了块就还原。
+            #
+            # Agent 内部对工具调用的调度 (LangGraph 的 ReAct 循环、它起的
+            # 子任务) 都在这个块里, ContextVar 会自动传播进去, 不需要把身份
+            # 当参数一层层往下传。
+            with task_identity(identity):
+                result = await state.agent.ainvoke(
+                    {"messages": [{"role": "user", "content": req.message}]},
+                    config=config,
+                )
+
+            # ReAct 循环产出的最后一条消息就是最终答复
+            messages = result.get("messages", [])
+            reply = messages[-1].content if messages else ""
+
+            # 把整轮里所有 AIMessage 的 tool_calls 按顺序收集起来。
+            # 注意是从【整个 messages 列表】扫, 不是只看最后一条 ——
+            # ReAct 可能有多轮工具调用, 最后一条通常已经没有 tool_calls 了。
+            tool_calls: list[str] = []
+            for msg in messages:
+                for call in getattr(msg, "tool_calls", None) or []:
+                    name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+                    if name:
+                        tool_calls.append(name)
+
+            # ★ 终态由这里报, 不由 CallbackHandler 报 ★
+            # 只有这里知道这轮 invocation 到底成没成。工具报错【不】代表任务失败 ——
+            # ReAct 循环存在的意义就是从工具错误里恢复。详见 app/task_state.py
+            # 里那段 ★ 注释, 那里记着把它映射成 FAILED 会怎样永久毁掉一个成功的任务。
+            if reporter is not None:
+                reporter.report(COMPLETED, {"result": reply})
+
+        except Exception as ex:
+            logger.exception("Agent 执行失败")
+            if reporter is not None:
+                reporter.report(FAILED, {"error": describe_exception(ex)})
+            raise HTTPException(
+                status_code=500,
+                detail=f"Agent 执行失败: {describe_exception(ex)}",
+            ) from ex
+        finally:
+            # 无论成功还是失败都要排空 —— 尤其不能丢掉刚入队的那条终态。
+            # 两条旁路并发收尾, 等待时间不叠加 (它们之间没有任何依赖)。
+            await asyncio.gather(
+                _drain_reporter(reporter),
+                _drain_audit(audit),
+            )
     finally:
-        # 无论成功还是失败都要排空 —— 尤其不能丢掉刚入队的那条终态。
-        # 两条旁路并发收尾, 等待时间不叠加 (它们之间没有任何依赖)。
-        await asyncio.gather(
-            _drain_reporter(reporter),
-            _drain_audit(audit),
-        )
+        # ★ 顺序: 先停心跳, 再注销存活登记 ★ 而且两步都在排空之后
+        # (排空发生在上面的内层 finally)。
+        #
+        # 为什么注销必须在排空之后: 反过来会制造一个窗口 —— 探活答 false,
+        # Java 立刻关链, 而那条 COMPLETED 还可能躺在队列里没发出去,
+        # 等它到达时 execution 已经闭链, 只能被 409 拒掉。
+        # 换句话说, "还在跑"要比"真实情况"多活几毫秒, 绝不能少活。
+        if beater is not None:
+            await beater.aclose()
+        if liveness_registered:
+            LIVENESS.unregister(trace_id)
 
     return ChatResponse(
         reply=reply,

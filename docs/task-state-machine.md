@@ -137,6 +137,7 @@ POST   /api/tasks                      创建任务          -> 任务（含 tra
 GET    /api/tasks/{id}                 查询任务（Redis 优先, miss 回落 MySQL）
 GET    /api/tasks/{id}/events          状态流转历史
 PATCH  /api/tasks/{id}/status          状态上报（Python 调这个）
+POST   /api/tasks/{id}/heartbeat       执行心跳（Python 调这个）-> 204
 POST   /api/tasks/{id}/retry           失败任务重试      -> 任务（含新 traceId）
 ```
 
@@ -157,7 +158,18 @@ POST   /api/tasks/{id}/retry           失败任务重试      -> 任务（含�
 `EXECUTION_MISMATCH`。
 
 `source` 取值（与 `agent_task_event.source` 字段对应）：
-`JAVA_GATEWAY` / `PYTHON_RUNTIME` / `SYSTEM_RETRY`
+`JAVA_GATEWAY` / `PYTHON_RUNTIME` / `SYSTEM_RETRY` / `SYSTEM_HEARTBEAT`
+
+`POST /api/tasks/{id}/heartbeat` 的请求体只有一个字段：
+
+```json
+{ "traceId": "cffac16e00000000cffac16e00000000" }
+```
+
+它**不改变状态、不写事件、不发审计** —— 只更新这次执行上的
+`last_heartbeat_at`。204 成功；400 缺 traceId；404 任务不存在；
+409 表示"别再跳了"（trace 对不上，或这次执行已经结束）。详见
+[心跳兜底](#心跳兜底2026-10-31)。
 
 ### 一次状态上报，Java 做五件事
 
@@ -323,13 +335,128 @@ mvn -pl km-task-service spring-boot:run
 
 #### 还没做的
 
-- **卡住的 PENDING 兜底**：派发读超时/Python 进程中途死掉时，任务会停在
-  PENDING、attempt 一直不闭链。需要一个"超过 N 分钟没进展"的扫描，但前提是
-  能确定 Python 那边真的没在跑 —— 贸然关链会制造双写，所以先不做。
 - **重试原因的操作者身份**：现在没有鉴权，审计的 `actor` 记的是任务归属
   用户，发起重试的人不记。等接入认证再补。
 - `/chat` 入口会拒绝终态任务（409，提示调用 `/retry`）；这是重试落地时
   一起补的，避免"Agent 白跑一整轮、所有上报都被拒"。
+
+### 心跳兜底（2026-10-31）
+
+自动重试补上了"失败之后怎么办"，但还有一类任务它永远看不到：**根本没有变成
+FAILED**。典型场景是派发读超时（请求可能已经在跑），或者 Python 接到请求后
+进程崩了 / 被 kill / 事件循环卡死。任务停在 PENDING（或 THINKING /
+TOOL_CALLING），`agent_task_attempt.ended_at` 一直为 NULL —— 自动重试只扫
+FAILED，于是这条任务永远不再被推进；未闭链的 attempt 还会让将来的重试被判
+"数据不一致"而拒绝。
+
+#### ★ 判据是"探活"，不是"心跳旧了" ★
+
+心跳停了有三种解释：
+
+1. Python 真的死了
+2. Python 活着，但连不上 Java（网络分区、Java 侧收不到）
+3. Java 自己收不到
+
+后两种情况下任务其实还在跑。**只凭"心跳过期"就关链 = 制造双写**：Java 把
+任务写成 FAILED 并触发自动重试，Python 那边还在跑同一份工作，两边的终态上报
+互相 409。
+
+所以协议做成**双向**：
+
+| 方向 | 接口 | 谁问谁 | 含义 |
+|---|---|---|---|
+| push | `POST /api/tasks/{id}/heartbeat` | Python → Java | "这次执行还活着"的时钟 |
+| pull | `GET /tasks/{trace}/alive` | Java → Python | "你那儿还有这条执行吗" |
+
+扫描只负责**发现可疑**（证据过期），能不能关链完全取决于探活的回答：
+
+| 探活结果 | 含义 | 处理 |
+|---|---|---|
+| `alive: true` | Python 正在跑 | 刷新 `last_heartbeat_at`，不动状态 |
+| `alive: false` | Python 明确说没有 | 关链 → `FAILED`，source=`SYSTEM_HEARTBEAT` |
+| 404 / 5xx / 连不上 / 字段缺失 | 问不出来 | **什么都不做**，下一轮再问 |
+
+第三行是安全边界：Python 还是旧版本（没有这个接口）、网络抖动、响应格式改了，
+都不能被当成"死了"。一次接口不同步造成的批量误杀，比晚关几条任务严重得多。
+
+#### 扫描范围：必须有"存活证据"
+
+```sql
+WHERE ended_at IS NULL
+  AND COALESCE(last_heartbeat_at, dispatched_at) IS NOT NULL
+  AND COALESCE(last_heartbeat_at, dispatched_at) <= :cutoff   -- now - stale_after
+ORDER BY started_at ASC LIMIT 20
+```
+
+`dispatched_at` 由 `RetryDispatcher` 在 POST `/chat` **之前**写入（
+`TaskService.markDispatched`）—— 先留证据再发请求，否则"请求发出去了但进程
+在写标记前崩溃"这条执行就没人能发现。
+
+★ 为什么不按"PENDING 超过 N 分钟"扫 ★ 时间本身不构成证据。一个刚创建的任务
+可能合法地停在 PENDING 等调用方发起（首次执行由外部触发，不是 Java 派的）。
+`dispatched_at` / `last_heartbeat_at` 两者都为空，恰好就是"没人能为这条执行
+作证"，直接排除。
+
+#### 为什么关成 FAILED，而不是 CANCELLED
+
+这次执行没完成，也不知道做到哪一步 —— 语义上就是失败。更重要的是：
+**FAILED 是唯一的重试入口**。关成 CANCELLED 会让任务永久停在"人工取消"，
+而用户并没有取消过。关成 FAILED 之后，`RetryScheduler` 按自己的退避和次数
+上限决定要不要再试 —— "怎么处理失败"仍然只有一套策略。
+
+关链走 `TaskService.reportStatus`，不是自己写 SQL：状态、事件、闭链、审计
+必须在同一个事务里，否则系统里就有了第二套状态机。
+
+#### Python 侧的顺序契约（★ 错了会打架 ★）
+
+```
+register(trace)          -- 在入口身份校验【之前】
+  ... ainvoke ...
+  drain terminal report  -- 先保证终态发出去
+unregister(trace)        -- 最后才撤销
+```
+
+- 登记早了没关系，登记晚了不行：校验窗口内轮到探活就会得到 `false`，误关。
+- 撤销早了不行：探活答 `false` → Java 立刻关链 → 那条 COMPLETED 还在队列里，
+  到达时 execution 已经闭链，只能 409。**"还在跑"宁可多答几毫秒，不能少答。**
+
+同一个 trace 并发跑了两份（客户端超时重发 `/chat`）时，登记按**引用计数**：
+先结束的那份不删登记，等最后一份退出才答 `false`。少了这一层，第一份一结束
+Java 就会把还在跑的第二份判死。
+
+#### 开关、默认值与灰度
+
+默认**关闭**（`km.heartbeat.enabled=false`）—— 它会自己把任务判死，进而触发
+自动重试（花钱），打开必须是显式决定。默认值：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `km.heartbeat.interval-ms` | 15000 | 多久扫一次，只影响发现延迟 |
+| `km.heartbeat.stale-after-seconds` | 120 | 证据多久算过期，必须 ≫ Python 心跳间隔（15s） |
+| `km.heartbeat.batch-size` | 20 | 一轮最多处理多少条 |
+| `km.heartbeat.tenant` | 空 | 灰度；空 = 全部 |
+| `km.heartbeat.probe-url` | `KM_PYTHON_CHAT_URL` | 探活和派发是同一个 Python 运行时 |
+
+```bash
+KM_HEARTBEAT_ENABLED=true \
+KM_HEARTBEAT_TENANT=heartbeat-e2e \
+KM_HEARTBEAT_STALE_AFTER_SECONDS=3 \
+KM_PYTHON_CHAT_URL=http://127.0.0.1:18081 \
+mvn -pl km-task-service spring-boot:run
+
+python km-control-plane/scripts/verify_heartbeat_sweep.py
+```
+
+验证脚本覆盖 5 个用例：正常心跳不被探活、探活 alive 只刷新、探活 dead 关链后
+被自动重试救回、探活 5xx 不动、心跳接口 204/400/404/409 且不写事件。
+
+#### ★ 单实例前提 ★
+
+`GET /tasks/{trace}/alive` 查的是 Python 进程内的内存登记。当前部署是单个
+uvicorn 进程，所以"本进程没有它" = "没人在跑它"。**多实例部署时这个等式不
+成立**：负载均衡可能把探活打到另一台，它会诚实地回答 `false` —— 那就是误判。
+那时必须把登记放到共享存储（Redis key + TTL），或者让探活带实例亲和性。
+代码注释里也写了这一条，别在扩容时忘了。
 
 ---
 
@@ -417,8 +544,10 @@ async def _report(self, to_status: str, detail: dict) -> None:
 一个"可观测性"功能把"可用性"搞坏了，完全得不偿失。
 
 **代价**：状态可能失真（Python 认为在跑，Java 记的是旧状态）。
-兜底手段是 Java 侧的**超时检测**（Phase 2 后期）：任务停在非终态超过 N 分钟 → 标记异常。
-这个兜底也正好是 `agent_task.retry_count` / `max_retry` 的用武之地。
+兜底手段是 Java 侧的**心跳兜底**（2026-10-31，见
+[心跳兜底](#心跳兜底2026-10-31)）：证据过期后 Java 反向探活 Python，
+**只有 Python 亲口回答"没有这条执行"才关链**。单看超时时间就判死是不行的
+—— 那会把"网络不通"当成"进程死了"，制造双写。
 
 **2. 上报要异步，不能阻塞 LLM 调用。**
 
@@ -469,6 +598,7 @@ Phase 1 是用户**直接**调 Python：
 | 5 | smoke test 加一条任务链路的用例 ✅ | `smoke_chat.py` 用例 T | 4 |
 | 6 | 手动重试 API（FAILED→PENDING，新 trace / 新 attempt）✅ | `scripts/verify_retry.py`（43 项断言）+ MySQL / audit_log 双信道核对 | 2 |
 | 7 | 自动重试（定时扫描 + 退避 + Java→Python 派发）✅ | `scripts/verify_auto_retry.py`（29 项断言，含假 Python 运行时） | 2, 6 |
+| 8 | 心跳兜底（Python push 心跳 + Java 反向探活，确认死亡才关链）✅ | `scripts/verify_heartbeat_sweep.py`（5 个用例）+ `tests/test_heartbeat.py` + `HeartbeatSweeperTest` | 2, 7 |
 
 **第 1 步是硬前置** —— 第 2 步之后全部依赖 MySQL。这也是为什么
 docker-compose 悬了两周是个真问题：它不是"顺便验一下"，而是卡着整条路。
@@ -614,6 +744,41 @@ body 逻辑，不是产品代码：真的 FastAPI 一直支持 chunked。
 
 回归防线：`RetrySchedulerTest`（8 项）+ `RetryDispatcherTest`（5 项）+
 `TaskServiceTest` 里"带来源重试"一条。
+
+### 第 8 步的实测结论（2026-10-31）
+
+`scripts/verify_heartbeat_sweep.py` 起一个假的 Python 运行时（:18081），打真服务
+（`stale=3s`、扫描 1s、心跳 0.4s、退避 1s/2s、租户 `heartbeat-e2e`），
+**32/32 通过**：
+
+| 要验的事 | 结果 |
+|---|---|
+| 心跳接口：204 / 400（缺 traceId）/ 404（任务不存在）/ 409（trace 不符、执行已结束） | ✅ |
+| 心跳不写事件行（连续 3 次心跳，事件数不变） | ✅ |
+| 正常心跳（0.4s 一次）全程没有被探活 | ✅ |
+| 没有心跳但探活 `alive=true`：不关链、留在 PENDING，两次探活间隔 ≈ stale 周期 | ✅ |
+| 探活 `alive=false`：关成 FAILED，source=`SYSTEM_HEARTBEAT`，detail 带 `phase=HEARTBEAT` / trace / 证据时间 | ✅ |
+| 关链后自动重试开了新链并跑到 COMPLETED（真正救回来） | ✅ |
+| 探活 500（UNKNOWN）：什么都不做，任务留在 PENDING | ✅ |
+
+实施顺序上有一点值得记：老 volume 不会重跑 `docker/init/mysql/01-schema.sql`，
+所以新列必须走 `docker/migrations/2026-10-31-heartbeat.sql`（幂等，
+`information_schema` 判断后再 `PREPARE/EXECUTE`）：
+
+```bash
+docker exec -i km-mysql mysql -ukm -pkm_dev_pwd km_control \
+  < docker/migrations/2026-10-31-heartbeat.sql
+```
+
+脚本本身也踩了一个坑，和产品无关但很像真的：用例 2/4 收尾时用**建任务时的
+trace** 上报 COMPLETED，稳定 409 `EXECUTION_MISMATCH` —— 任务已经被自动重试
+滚到新链了。正确做法是拿 `/chat 派发时收到的 trace_id` 上报。这就是"换指针
+和开新链在同一事务里"的另一面：**任何拿旧 trace 上报的地方都会失败**，
+包括验收脚本。
+
+回归防线：见 [审计 §11.9](audit.md#十一还没做的部分) —— 那一节末尾列了
+`HeartbeatProbeTest` / `HeartbeatSweeperTest` / `TaskServiceTest` /
+`tests/test_heartbeat.py` / `tests/test_chat_task_wiring.py` 的覆盖点。
 
 ### 一个从 Java 侧照搬过来会出事的断言
 

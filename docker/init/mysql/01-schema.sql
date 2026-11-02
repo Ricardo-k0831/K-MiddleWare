@@ -73,10 +73,25 @@ CREATE TABLE IF NOT EXISTS agent_task_attempt (
     status        VARCHAR(32)  NOT NULL DEFAULT 'RUNNING',
     started_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     ended_at      DATETIME(3)  COMMENT 'NULL = 这次执行还没结束',
+
+    -- ★ 心跳兜底用的两列 (见 com.km.task.heartbeat) ★
+    --
+    -- dispatched_at: Java 把 /chat 发出去的时点。NULL = 还没派发。
+    --   ★ 不能只看 started_at ★ 首次执行由调用方自己发起, 任务建好后可能
+    --   合法地停在 PENDING 很久; 没有"派发"这个证据, 任何超时判断都会误杀
+    --   还在等调用方的任务。
+    dispatched_at     DATETIME(3) COMMENT 'Java 派发 /chat 的时点; NULL = 未派发',
+    -- last_heartbeat_at: Python 在执行期间定期刷新; Java 探活命中 alive=true
+    --   时也会刷它 (探活本身也是一次心跳)。
+    --   NULL = 这次执行从来没跑起来过。
+    last_heartbeat_at DATETIME(3) COMMENT '最近一次心跳; NULL = 从没跑起来',
+
     PRIMARY KEY (id),
     UNIQUE KEY uk_attempt_trace (trace_id),
     UNIQUE KEY uk_attempt_no (agent_task_id, attempt_no),
-    KEY idx_attempt_task (agent_task_id, attempt_no)
+    KEY idx_attempt_task (agent_task_id, attempt_no),
+    -- 扫描器只捞"开着的、且有过派发/心跳证据"的执行
+    KEY idx_attempt_open (ended_at, dispatched_at, last_heartbeat_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='任务执行尝试: 一次执行 = 一条调用链, trace_id 的权威来源';
 
@@ -90,7 +105,7 @@ CREATE TABLE IF NOT EXISTS agent_task_event (
     agent_task_id VARCHAR(64)  NOT NULL,
     from_status   VARCHAR(32),
     to_status     VARCHAR(32)  NOT NULL,
-    -- 谁触发的状态变更: JAVA_GATEWAY / PYTHON_RUNTIME / SYSTEM_RETRY
+    -- 谁触发的状态变更: JAVA_GATEWAY / PYTHON_RUNTIME / SYSTEM_RETRY / SYSTEM_HEARTBEAT
     source        VARCHAR(32)  NOT NULL,
     detail        JSON                   COMMENT '变更上下文, 如工具名/耗时',
     created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),

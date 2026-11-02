@@ -53,7 +53,9 @@ import org.springframework.web.client.RestClientResponseException;
  *       这时如果回写 FAILED, 就会出现"任务显示失败, 但 Python 还在跑并继续
  *       上报"的双写: 后到的上报会被终态拒绝, 审计里留下一串 409。所以只记
  *       日志, <b>不关链</b>, 让 Python 自己的终态上报来收尾; 真的一直不回来,
- *       那属于"卡住的 PENDING", 需要单独的兜底扫描 (暂未实现), 不在这里猜。</li>
+ *       那属于"卡住的 PENDING", 由心跳兜底扫描处理
+ *       ({@code com.km.task.heartbeat.HeartbeatSweeper}) —— 但前提是它先
+ *       主动探活确认 Python 那边真的没在跑, 不在这里猜。</li>
  *   <li><b>线程池满</b> —— 请求根本还没发出去。和连接失败一样, 可以安全地
  *       标记 FAILED。</li>
  * </ul>
@@ -109,12 +111,18 @@ public class RetryDispatcher {
         }
     }
 
-    // 线程池线程会将任务对象发送给 chat 接口重新执行
     private void run(AgentTask task) {
         String taskId = task.getAgentTaskId();
         String traceId = task.getTraceId();
+        // ★ 先留"我派发过"的证据, 再发请求 ★
+        //
+        // 心跳兜底扫描只愿意处理"有派发或心跳证据"的执行 —— 见
+        // TaskService.markDispatched 的注释。顺序上先标记再发: 如果反过来,
+        // 请求已经到 Python 了而标记还没写, 这几十毫秒里扫描器看到的是一条
+        // 没有证据的执行, 它会被一直忽略到下一次有人刷新为止 (而可能没有
+        // 下一次)。标记失败不影响派发本身, 所以只记日志。
+        markDispatched(task);
         try {
-            // 发送请求到 Python 服务器 的 chat 接口, 传递任务对象 (Map格式体)
             restClient.post()
                     .uri("/chat")
                     // thread_id 用 task_id: 一次执行就是一个独立会话。
@@ -125,7 +133,7 @@ public class RetryDispatcher {
                     .retrieve()
                     .toBodilessEntity();
             log.info("重试派发成功 (已交给 Python) task={} trace={}", taskId, traceId);
-        } catch (ResourceAccessException e) { //连接失败
+        } catch (ResourceAccessException e) {
             if (neverReachedPython(e)) {
                 // 连接阶段就失败了: 确定 Python 没收到, 可以关链。
                 log.warn("重试派发连接失败 (Python 不可达) task={} trace={}: {}",
@@ -148,7 +156,23 @@ public class RetryDispatcher {
         }
     }
 
-    //将 任务对象 转换为 Map格式  (Python请求体)
+    /**
+     * 记录"这次执行已经派发"。失败只降级 (扫描器看不到这一条), 不阻断派发。
+     */
+    private void markDispatched(AgentTask task) {
+        try {
+            if (!taskService.markDispatched(task.getAgentTaskId(), task.getTraceId())) {
+                // 执行在派发前就闭链了 —— 正常流程不会发生。请求照发,
+                // Python 的入口身份校验会把它挡在花钱之前 (409)。
+                log.warn("派发前标记 dispatched 落空 (执行已结束?) task={} trace={}",
+                        task.getAgentTaskId(), task.getTraceId());
+            }
+        } catch (RuntimeException e) {
+            log.warn("派发前标记 dispatched 失败 (心跳兜底可能扫不到这次执行) task={} trace={}",
+                    task.getAgentTaskId(), task.getTraceId(), e);
+        }
+    }
+
     private Map<String, Object> payload(AgentTask task) {
         Map<String, Object> body = new LinkedHashMap<>();
         // message 用的还是最初的 intent: 重试 = 把同一件事再做一遍。
@@ -174,11 +198,11 @@ public class RetryDispatcher {
         detail.put("phase", "DISPATCH");
         detail.put("error", error);
         try {
-            // 回写 FAILED 状态, 因为toStatus是任务的终态, 所以也会把该任务刚开的执行关掉。
             taskService.reportStatus(task.getAgentTaskId(), task.getTraceId(),
                     TaskStatus.FAILED, TaskEventSource.SYSTEM_RETRY, detail);
         } catch (RuntimeException e) {
-            // 连回写都出了问题,任务当前状态可能是PENDING, 并且调用可能是因为失败而停止着的. 前后是矛盾的
+            // 走到这里任务会停在 PENDING 且没有执行在跑 —— 数据不一致,
+            // 只能告警等人工处理, 不能在这里再猜一次。
             log.error("派发失败后回写 FAILED 也失败 task={} trace={} —— 任务可能停在 PENDING",
                     task.getAgentTaskId(), task.getTraceId(), e);
         }

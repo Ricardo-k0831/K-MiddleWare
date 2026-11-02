@@ -15,5 +15,14 @@ public enum TaskEventSource {
     PYTHON_RUNTIME,
 
     /** 系统的超时重试 / 补偿任务 */
-    SYSTEM_RETRY
+    SYSTEM_RETRY,
+
+    /**
+     * 心跳兜底扫描: 确认 Python 侧没有这条执行在跑之后, 由系统关掉链路。
+     *
+     * <p>和 {@link #SYSTEM_RETRY} 分开, 是因为它们回答两个不同的问题:
+     * 前者是"失败之后谁又试了一遍", 后者是"谁发现这次执行其实已经死了"。
+     * 混成一个值的话, 事后统计"有多少任务是心跳救回来的"就得去猜 detail。
+     */
+    SYSTEM_HEARTBEAT
 }

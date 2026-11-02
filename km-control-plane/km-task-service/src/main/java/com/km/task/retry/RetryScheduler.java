@@ -76,11 +76,11 @@ public class RetryScheduler {
     @Scheduled(fixedDelayString = "${km.retry.scheduler.interval-ms:10000}")
     public void sweep() {
         LocalDateTime now = LocalDateTime.now();
-        // 退避时间范围: [base, max]
         int base = Math.max(1, config.getBaseBackoffSeconds());
         int maxBackoff = Math.max(base, config.getMaxBackoffSeconds());
 
         List<AgentTask> candidates;
+        // 1. 粗筛
         try {
             candidates = taskMapper.selectList(candidateQuery(now.minusSeconds(base)));
         } catch (RuntimeException e) {
@@ -93,6 +93,7 @@ public class RetryScheduler {
         }
 
         int retried = 0;
+        // 2. 精筛
         for (AgentTask task : candidates) {
             int retryCount = task.getRetryCount() == null ? 0 : task.getRetryCount();
             // 粗筛只按 base 过滤, 这里再按这一任务自己的退避判断。

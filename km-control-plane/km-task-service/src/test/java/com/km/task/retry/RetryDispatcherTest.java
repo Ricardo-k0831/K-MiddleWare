@@ -25,7 +25,6 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.jsonPath;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
@@ -72,8 +71,10 @@ class RetryDispatcherTest {
         dispatcher().dispatch(task());
 
         backend.verify();
+        // 派发前必须先留下"我派发过"的证据, 否则心跳兜底扫描永远看不到这次执行。
+        verify(taskService).markDispatched("task-1", "trace-new");
         // 派发成功不代表任务成功: 结果由 Python 的 PATCH 上报, 这里不写状态。
-        verifyNoInteractions(taskService);
+        verify(taskService, never()).reportStatus(any(), any(), any(), any(), anyMap());
     }
 
     @Test
@@ -85,6 +86,7 @@ class RetryDispatcherTest {
 
         dispatcher().dispatch(task());
 
+        verify(taskService).markDispatched("task-1", "trace-new");
         verify(taskService).reportStatus(eq("task-1"), eq("trace-new"),
                 eq(TaskStatus.FAILED), eq(TaskEventSource.SYSTEM_RETRY),
                 argThat(detail -> "DISPATCH".equals(detail.get("phase"))

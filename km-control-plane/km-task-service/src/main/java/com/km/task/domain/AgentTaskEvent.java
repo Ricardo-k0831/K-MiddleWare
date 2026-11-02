@@ -52,7 +52,7 @@ public class AgentTaskEvent {
 
     private String toStatus;
 
-    /** 谁触发的: JAVA_GATEWAY / PYTHON_RUNTIME / SYSTEM_RETRY */
+    /** 谁触发的: JAVA_GATEWAY / PYTHON_RUNTIME / SYSTEM_RETRY / SYSTEM_HEARTBEAT */
     private String source;
 
     /** 变更上下文, 如 {"toolName": "get_order_by_id"}。存成 JSON 列。 */

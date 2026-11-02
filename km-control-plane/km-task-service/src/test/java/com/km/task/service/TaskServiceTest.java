@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -445,6 +446,95 @@ class TaskServiceTest {
         verify(attemptMapper, never()).insert(any(AgentTaskAttempt.class));
         verifyNoInteractions(eventMapper);
         verify(audit, never()).publish(any());
+    }
+
+    // ------------------------------------------------------------------
+    //  心跳 / 派发标记
+    // ------------------------------------------------------------------
+
+    @Test
+    void 心跳只更新执行上的时间戳_不写事件不发审计() {
+        when(taskMapper.selectById(TASK_ID)).thenReturn(task(TaskStatus.THINKING, TRACE_ID));
+        when(attemptMapper.selectOne(any())).thenReturn(attempt(TASK_ID, TRACE_ID));
+        when(attemptMapper.update(isNull(), any())).thenReturn(1);
+
+        service.heartbeat(TASK_ID, TRACE_ID);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Wrapper<AgentTaskAttempt>> captor = ArgumentCaptor.forClass(Wrapper.class);
+        verify(attemptMapper).update(isNull(), captor.capture());
+        String sqlSet = captor.getValue().getSqlSet().toString();
+        assertTrue(sqlSet.contains("last_heartbeat_at"), "心跳没写时间戳: " + sqlSet);
+
+        // ★ 心跳不是状态流转 ★ 一次执行几十条心跳, 写进事件表会把真正的
+        // 流转序列淹没; 审计同理。心跳只值一行 UPDATE。
+        verifyNoInteractions(eventMapper);
+        verify(audit, never()).publish(any());
+        verify(taskMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void 心跳的trace不属于这个任务时拒绝() {
+        when(taskMapper.selectById(TASK_ID)).thenReturn(task(TaskStatus.THINKING, TRACE_ID));
+        when(attemptMapper.selectOne(any())).thenReturn(attempt("other-task", "trace-of-other"));
+
+        ExecutionMismatchException ex = assertThrows(ExecutionMismatchException.class,
+                () -> service.heartbeat(TASK_ID, "trace-of-other"));
+
+        // 身份错了就一行都不该写: 否则一条带错 trace 的心跳会给别的执行续命,
+        // 而心跳的唯一作用恰恰是判断生死。
+        assertTrue(ex.getMessage().contains("other-task"));
+        verify(attemptMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void 已闭链的执行不接受心跳() {
+        when(taskMapper.selectById(TASK_ID)).thenReturn(task(TaskStatus.COMPLETED, TRACE_ID));
+        AgentTaskAttempt closed = attempt(TASK_ID, TRACE_ID);
+        closed.setEndedAt(LocalDateTime.now());
+        when(attemptMapper.selectOne(any())).thenReturn(closed);
+
+        assertThrows(ExecutionMismatchException.class,
+                () -> service.heartbeat(TASK_ID, TRACE_ID));
+
+        verify(attemptMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void 心跳写到一半执行闭链时按身份冲突处理() {
+        when(taskMapper.selectById(TASK_ID)).thenReturn(task(TaskStatus.THINKING, TRACE_ID));
+        when(attemptMapper.selectOne(any())).thenReturn(attempt(TASK_ID, TRACE_ID));
+        // 读到还开着, 写的时候已经闭链 (终态上报赢了)
+        when(attemptMapper.update(isNull(), any())).thenReturn(0);
+
+        // 409 而不是静默成功 —— 让 Python 知道"别再给我发心跳了"。
+        assertThrows(ExecutionMismatchException.class,
+                () -> service.heartbeat(TASK_ID, TRACE_ID));
+    }
+
+    @Test
+    void 派发标记写的是dispatched_at() {
+        when(attemptMapper.selectOne(any())).thenReturn(attempt(TASK_ID, TRACE_ID));
+        when(attemptMapper.update(isNull(), any())).thenReturn(1);
+
+        assertTrue(service.markDispatched(TASK_ID, TRACE_ID));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Wrapper<AgentTaskAttempt>> captor = ArgumentCaptor.forClass(Wrapper.class);
+        verify(attemptMapper).update(isNull(), captor.capture());
+        String sqlSet = captor.getValue().getSqlSet().toString();
+        assertTrue(sqlSet.contains("dispatched_at"), "没写派发时刻: " + sqlSet);
+        // 派发标记不是心跳: 不能顺便把 last_heartbeat_at 写成 now,
+        // 否则"派发了但 Python 从没跑起来"和"Python 跑过又死了"就分不开了。
+        assertTrue(!sqlSet.contains("last_heartbeat_at"), "派发标记污染了心跳列: " + sqlSet);
+    }
+
+    @Test
+    void 执行已结束时派发标记返回false() {
+        when(attemptMapper.selectOne(any())).thenReturn(attempt(TASK_ID, TRACE_ID));
+        when(attemptMapper.update(isNull(), any())).thenReturn(0);
+
+        assertFalse(service.markDispatched(TASK_ID, TRACE_ID));
     }
 
     // ------------------------------------------------------------------

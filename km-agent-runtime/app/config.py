@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     km_task_service_url: str = "http://localhost:8083"
     # 回调是旁路, 宁可丢弃也不要拖慢 Agent 主流程 —— 所以超时给得短。
     km_task_service_timeout_seconds: float = 2.0
+    # 执行期间给 Java 发心跳的间隔。Java 侧 km.heartbeat.stale-after-seconds
+    # 必须远大于它 (默认 120s vs 15s) —— 丢一两个心跳不该触发探活。
+    #
+    # 心跳的作用: Java 发现"派发出去之后长时间没有任何证据"时, 会主动
+    # GET /tasks/{trace}/alive 探活; 心跳是在正常路径上提前把时钟推后,
+    # 让探活只发生在真正可疑的执行上。
+    heartbeat_interval_seconds: float = 15.0
     # 提交审计时的内部认证 token (HTTP 头 X-KM-Audit-Token)。
     #
     # 必须和 Java 侧 km.audit.ingest.token 一致, 否则 /api/audit/events 会回 401,
