@@ -618,6 +618,7 @@ public class TaskService {
 
         AgentTaskAttempt attempt = attemptMapper.selectOne(
                 Wrappers.<AgentTaskAttempt>lambdaQuery()
+
                         .eq(AgentTaskAttempt::getTraceId, traceId));
 
         if (attempt == null) {

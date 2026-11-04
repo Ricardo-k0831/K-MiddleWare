@@ -54,11 +54,20 @@ def build_llm(settings: Settings) -> ChatOpenAI:
     )
 
 
-async def build_agent(provider: ToolProvider, settings: Settings) -> Any:
+async def build_agent(
+    provider: ToolProvider,
+    settings: Settings,
+    checkpointer: Any | None = None,
+) -> Any:
     """组装 Agent。
 
     工具从 ToolProvider 拿 —— 也就是说, Agent 能看见哪些能力, 完全由
     Java 网关的权限裁剪决定。Python 侧不做任何权限判断。
+
+    ``checkpointer`` 由 ``app/checkpoint.py`` 装配后传进来 (memory 或
+    postgres)。不传时退回进程内的 ``InMemorySaver`` —— 保住"不依赖
+    Postgres 也能起服务"这条底线, 但不推荐: 进程一重启对话记忆就没了,
+    断点续跑也无从谈起。
     """
     tools = await provider.build_langchain_tools()
     if not tools:
@@ -70,14 +79,12 @@ async def build_agent(provider: ToolProvider, settings: Settings) -> Any:
     # config={"configurable": {"thread_id": ...}} 才真正有意义。
     # 没有它, 那个 config 是【空转的】—— 每轮请求彼此独立, 多轮对话不成立。
     #
-    # InMemorySaver = 进程内记忆: 单机开发够用, 但【进程一重启就丢】。
-    # 它只是让多轮对话"真起来"的第一步, 不是终点 ——
-    # 要持久化就换成 PostgresSaver (docker-compose 里的 pgvector 就是干这个的),
-    # 接口一致, 只改这一行。
-    #
     # 边界: 这里存的是【对话消息历史】(LLM 的上下文记忆), 不是【任务的业务状态】。
     # 后者一律回调 Java —— 见文件头部那条约定。
-    checkpointer = InMemorySaver()
+    #
+    # 用什么后端在 app/checkpoint.py 里决定, 这里只认接口。
+    if checkpointer is None:
+        checkpointer = InMemorySaver()
 
     return create_react_agent(
         build_llm(settings),

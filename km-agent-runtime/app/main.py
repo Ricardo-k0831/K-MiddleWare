@@ -24,6 +24,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.audit import AuditCallbackHandler, AuditReporter
+from app.checkpoint import (
+    BACKEND_POSTGRES,
+    MODE_FRESH,
+    CheckpointResources,
+    build_checkpointer,
+    memory_resources,
+    plan_invocation,
+)
 from app.config import get_settings
 from app.graph.agent import build_agent
 from app.heartbeat import HeartbeatBeater, LivenessRegistry
@@ -74,6 +82,9 @@ class AppState:
     provider: ToolProvider | None = None
     agent: Any = None
     startup_error: str | None = None
+    # checkpointer 及其连接池。收尾时必须显式关闭 —— 漏了不会报错,
+    # 只会让进程退出时挂住, 或者 Postgres 那边堆一堆 idle 连接。
+    checkpoints: CheckpointResources | None = None
 
 
 state = AppState()
@@ -94,19 +105,58 @@ async def lifespan(app: FastAPI):
     provider = build_tool_provider(settings)
     state.provider = provider
 
+    # checkpointer 必须在建图之前装配: create_react_agent 会把它挂到图上,
+    # 之后换不掉。
     try:
-        state.agent = await build_agent(provider, settings)
-        logger.info("Agent 运行时启动完成")
-    except Exception as ex:
-        # 启动失败不直接退出进程 —— 让 /health 和 /agent/tools 还能回答问题,
-        # 否则排查"到底是网关没起来还是 Python 写错了"会非常痛苦。
+        state.checkpoints = await build_checkpointer(settings)
+    except ValueError as ex:
+        # 配置写错了 (比如 CHECKPOINT_BACKEND=postgress)。★ 不降级 ★ ——
+        # 静默退回内存正是 checkpoint.py 里最想避免的结果: 以为在持久化,
+        # 其实每次重启都在丢断点。这种错只能让人改配置。
         state.startup_error = describe_exception(ex)
-        logger.exception("Agent 装配失败, 服务以降级模式启动")
+        state.checkpoints = None
+        logger.exception("checkpointer 配置错误, 服务以降级模式启动")
+    except Exception as ex:
+        # Postgres 连不上是基础设施故障, 不是配置错。checkpoint 存的是
+        # 对话记忆, 任务状态的事实源仍在 Java —— 按"旁路坏了不能把可用性
+        # 搞坏"处理 (和审计/心跳同一条原则), 降级为进程内记忆。
+        # 代价 (重启丢断点) 会在日志和 /health 的 checkpoint_degraded 里说清楚。
+        logger.exception("checkpointer 装配失败, 降级为进程内记忆 (断点续跑不可用)")
+        state.checkpoints = memory_resources(degraded_reason=describe_exception(ex))
+
+    if state.checkpoints is not None:
+        try:
+            state.agent = await build_agent(provider, settings, state.checkpoints.saver)
+            logger.info("Agent 运行时启动完成")
+        except Exception as ex:
+            # 启动失败不直接退出进程 —— 让 /health 和 /agent/tools 还能回答问题,
+            # 否则排查"到底是网关没起来还是 Python 写错了"会非常痛苦。
+            state.startup_error = describe_exception(ex)
+            # Agent 没建起来的话 checkpointer 也没人用, 留着只是占连接。
+            await state.checkpoints.aclose()
+            state.checkpoints = None
+            logger.exception("Agent 装配失败, 服务以降级模式启动")
+
+        if (
+            state.checkpoints is not None
+            and state.checkpoints.backend == BACKEND_POSTGRES
+        ):
+            # 持久化之后, thread_id="default" 就不再是"一次进程内的顺手记忆",
+            # 而是一个所有匿名调用共享、且跨重启保留的全局线程 —— 跨租户
+            # 串上下文的风险从"重启即消失"变成"永久存在"。这里先提醒,
+            # 真正的隔离 (按 tenant/user 命名空间化) 等有会话级调用方时再做。
+            logger.warning(
+                "checkpoint=postgres: 不带 task_id 的 /chat 会共用 thread_id='default', "
+                "多客户端部署时应显式传 thread_id"
+            )
 
     yield
 
     if state.provider is not None:
         await state.provider.aclose()
+    if state.checkpoints is not None:
+        await state.checkpoints.aclose()
+        state.checkpoints = None
     logger.info("Agent 运行时已关闭")
 
 
@@ -197,9 +247,26 @@ async def health() -> dict[str, Any]:
     startup_error 不为空说明 Agent 没装配成功 —— 这是排查链路问题的第一站。
     """
     return {
-        "status": "ok" if state.startup_error is None else "degraded",
+        # 记忆降级也算 degraded: 服务能跑, 但"重启后断点续不上"必须能从
+        # 健康检查上看出来, 不能只躺在启动日志里。
+        "status": (
+            "ok"
+            if state.startup_error is None
+            and (state.checkpoints is None or state.checkpoints.degraded_reason is None)
+            else "degraded"
+        ),
         "agent_ready": state.agent is not None,
         "startup_error": state.startup_error,
+        # 记忆后端要能从外面看出来。排查"重启后为什么断点没续上"时,
+        # 第一件事就是确认它到底是 memory 还是 postgres —— 而不是去翻日志。
+        "checkpoint_backend": (
+            state.checkpoints.backend if state.checkpoints is not None else None
+        ),
+        # 配了 postgres 却显示 backend=memory 时, 这里给出原因。
+        # 没有它的话, "降级"和"本来就没配持久化"在 /health 上长得一模一样。
+        "checkpoint_degraded": (
+            state.checkpoints.degraded_reason if state.checkpoints is not None else None
+        ),
     }
 
 # 该接口返回的工具是ToolSpec列表, 不是 LangChain的 BaseTool 列表
@@ -517,6 +584,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
         # 要做到会话级记忆, thread_id 应当是 session_id, 用 LangGraph 的
         # checkpoint_ns 区分任务 —— 那是 Phase 2 的事。这里写清楚, 是为了
         # 避免误以为"同一会话的多个任务共享记忆"而按这个前提去设计功能。
+        #
+        # 但"按任务隔离"恰好是断点续跑要的: 重试换的是 trace, task_id 不变,
+        # 所以同一个任务的第 N 次执行天然落在同一个 thread 上 —— 不需要任何
+        # 映射表, 也不需要把上一次的执行位置存进 agent_task.checkpoint_ref。
         thread_id = task_id or req.thread_id
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
         if callbacks:
@@ -536,20 +607,44 @@ async def chat(req: ChatRequest) -> ChatResponse:
             # 子任务) 都在这个块里, ContextVar 会自动传播进去, 不需要把身份
             # 当参数一层层往下传。
             with task_identity(identity):
-                result = await state.agent.ainvoke(
-                    {"messages": [{"role": "user", "content": req.message}]},
-                    config=config,
+                # 先问 checkpoint 这个 thread 停没停在半路, 再决定喂什么输入。
+                # 三种处置 (续跑 / 复述结果 / 开新一轮) 的判据和理由都写在
+                # app/checkpoint.py 的 plan_invocation 里。
+                plan = await plan_invocat
+                ion(
+                    state.agent,
+                    config,
+                    req.message,
+                    task_scoped=task_id is not None,
                 )
+                if plan.mode != MODE_FRESH:
+                    logger.info(
+                        "thread=%s 命中 checkpoint, 按 %s 处置 (pending=%s)",
+                        thread_id,
+                        plan.mode,
+                        plan.pending_nodes or "-",
+                    )
+                result = await state.agent.ainvoke(plan.payload, config=config)
 
-            # ReAct 循环产出的最后一条消息就是最终答复
+            # ReAct 循环产出的最后一条消息就是最终答复。
+            # 注意 replay 时图一个节点都不跑, 返回的是上次的最终状态 ——
+            # 这里取到的仍然是那个答复, 正是"终态上报丢了, 重试补一条"要的。
             messages = result.get("messages", [])
             reply = messages[-1].content if messages else ""
 
-            # 把整轮里所有 AIMessage 的 tool_calls 按顺序收集起来。
-            # 注意是从【整个 messages 列表】扫, 不是只看最后一条 ——
-            # ReAct 可能有多轮工具调用, 最后一条通常已经没有 tool_calls 了。
+            # 只扫【本次 invocation 新增的】消息。
+            #
+            # ★ 为什么不能扫整个 messages ★ 接了持久化之后, result 里带的是
+            # 这个 thread 从建立到现在的全部历史。扫全部的话, 上一轮的工具名
+            # 会被算进这一轮的 tool_calls —— 验收脚本会因此误判"Agent 又调了
+            # 一次工具", 或者更糟, 把重试的 replay 误判成"重新执行过"。
+            # plan.baseline_messages 就是调用前已有的条数。
+            #
+            # 仍然扫多轮 (不是只看最后一条): ReAct 可能连续调用多个工具,
+            # 最后一条通常已经没有 tool_calls 了。
+            new_messages = messages[plan.baseline_messages:]
             tool_calls: list[str] = []
-            for msg in messages:
+            for msg in new_messages:
                 for call in getattr(msg, "tool_calls", None) or []:
                     name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
                     if name:

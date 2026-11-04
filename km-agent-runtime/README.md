@@ -26,6 +26,12 @@ uv run pytest tests/test_mcp_handshake.py -v -s
 
 # 5. 起服务
 uv run uvicorn app.main:app --reload --port 8000
+
+# ★ Windows + CHECKPOINT_BACKEND=postgres 的额外要求 ★
+# psycopg 的异步连接不支持 Windows 默认的 ProactorEventLoop。
+# --reload 时 uvicorn 在子进程里用的是 Selector, 所以开发命令没问题;
+# 去掉 --reload 的话必须显式指定:
+#   uv run uvicorn app.main:app --loop asyncio:SelectorEventLoop --port 8000
 ```
 
 ## 验证

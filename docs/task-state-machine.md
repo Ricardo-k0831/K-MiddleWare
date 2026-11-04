@@ -114,6 +114,58 @@ Python 只能**上报**，不能**决定**状态。
 > 反面做法：另生成一个 `thread_id` 并存进 `checkpoint_ref`。
 > 多一层映射，多一处可能不一致的地方，收益为零。
 
+### 持久化与断点续跑（2026-11-02）
+
+checkpointer 之前固定是 `InMemorySaver`：进程一重启图状态就没了，"用同一个
+`thread_id` 重新 invoke" 只在同一个进程里成立，断点续跑其实无从谈起。现在由
+`km-agent-runtime/app/checkpoint.py` 装配，后端由 `CHECKPOINT_BACKEND` 显式选择：
+
+| 值 | 实现 | 适用 |
+|---|---|---|
+| `memory`（默认） | `InMemorySaver` | 开发/测试；重启即丢 |
+| `postgres` | `AsyncPostgresSaver` + `psycopg_pool.AsyncConnectionPool` | 断点续跑；落在 `km_memory`，启动时自动 `setup()` 建表 |
+
+默认仍是 memory：改变持久化语义必须是显式决定，和 `km.retry` / `km.heartbeat`
+默认关闭同一个理由。
+
+**重试时怎么"续上"而不是"重跑"**：Java 重试换的是 `traceId`，`task_id` 不变，
+因此第 N 次执行天然落在同一个 thread 上。`/chat` 调用图之前先 `aget_state`
+读快照，按 `snapshot.next` 分三种处置（实现见 `plan_invocation`）：
+
+| 快照 | 处置 | 传给 `ainvoke` 的输入 | 为什么 |
+|---|---|---|---|
+| `next` 非空 | resume | `None` | 有节点没跑完（崩溃/异常都表现为这个）；再追加消息会把同一个问题问两遍 |
+| `next` 空 + 最后一条是 AI 消息（任务链路） | replay | `None` | 图已经跑完，只是终态上报丢了；复述结果，不再花一次 LLM |
+| 其余 | fresh | `{"messages": [...]}` | 首次执行，或 checkpoint 已丢（如 memory 后端重启） |
+
+自由对话（不带 `task_id`）只在"重发的正是挂起前最后那条用户消息"时才 resume，
+否则一律 fresh —— 用户在一个挂起的 thread 上问新问题时，空输入续跑会把新消息吞掉
+（实测"带新输入 + 有待执行节点"的组合，LangGraph 会先写入新消息再重跑节点）。
+
+> **副作用边界**：resume 重跑的是"未完成的节点"。如果崩溃点在工具调用之后、
+> 结果写回之前，那个工具会被再调一次。有副作用的工具（下单、支付）必须自带
+> 幂等键 —— 这是 checkpoint 语义本身的边界，重试层兜不住。
+
+**两个配套修正**：
+
+- `tool_calls` 只统计本次 invocation 新增的消息（`plan.baseline_messages` 是调用前
+  的条数）。持久化后 `result["messages"]` 是整个 thread 的历史，扫全部会把上一轮
+  的工具名算进这一轮，验收脚本会误判 replay 为"重新执行过"。
+- Postgres 连不上时降级为进程内记忆，并在 `/health` 的 `checkpoint_degraded` 里
+  给出原因；配置名写错（如 `postgress`）则直接启动失败 —— 拼错不能静默变成
+  "以为在持久化，其实重启就丢"。
+
+**单实例提醒**：`thread_id="default"` 在 postgres 后端下是一个所有匿名调用共享、
+且跨重启保留的全局线程。生产环境不带 `task_id` 的调用应当显式传 `thread_id`。
+
+**Windows 启动要求**：psycopg 的异步连接不支持 Windows 默认的 ProactorEventLoop。
+`--reload` 时 uvicorn 在子进程里用 Selector，所以开发命令照旧；不带 `--reload`
+时必须加 `--loop asyncio:SelectorEventLoop`。漏了的话 `build_checkpointer` 会
+当场给出这条提示（而不是等连接池 10 秒超时）。
+
+会话级记忆仍未实现：要让同一 `session_id` 的多个任务共享上下文，需要
+`thread_id=session_id` + `checkpoint_ns` 区分任务，那是另一项设计变更。
+
 ---
 
 ## 四、Java 侧：新增 `km-task-service` 模块（:8083）

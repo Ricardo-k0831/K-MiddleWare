@@ -188,6 +188,13 @@ def preflight(client: httpx.Client) -> list[str]:
                 f"Agent 未装配完成 (startup_error={health.get('startup_error')!r})"
                 " —— 通常是 km-mcp-server (:8081) 没起来, 或工具定义有编译错误"
             )
+        # 只报告不判定: smoke 不预设记忆后端。但"重试没续上"的第一现场就是它,
+        # 顺手打出来, 省得每次再去翻 /health。
+        degraded = health.get("checkpoint_degraded")
+        print(
+            f"记忆后端: {health.get('checkpoint_backend')}"
+            + (f" (已降级: {degraded})" if degraded else "")
+        )
     except Exception as ex:
         problems.append(f"agent runtime (:8000) 不可达: {type(ex).__name__}")
 
@@ -401,11 +408,19 @@ def run_task_case(client: httpx.Client, case: dict, show_reply: bool) -> bool:
         failures.append(f"新建任务的状态应是 PENDING, 实际 {task['status']!r}")
 
     # 带 task_id 调 /chat —— 刻意【不传 thread_id】: task_id 自己就是 thread_id。
+    # trace_id / tenant_id / actor 必须从建任务响应里原样转交: 带 task_id 却缺
+    # trace_id 会被入口直接 400, 而且缺了它这次运行的所有上报都归不了位。
     print(f"问: {case['message']}")
     try:
         r = client.post(
             f"{AGENT_BASE}/chat",
-            json={"message": case["message"], "task_id": task_id},
+            json={
+                "message": case["message"],
+                "task_id": task_id,
+                "trace_id": task["traceId"],
+                "tenant_id": task.get("tenantId"),
+                "actor": task.get("userId"),
+            },
             timeout=180.0,
         )
     except Exception as ex:

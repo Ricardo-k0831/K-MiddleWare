@@ -59,10 +59,11 @@ CREATE INDEX IF NOT EXISTS idx_episode_memory_lookup
 -- ------------------------------------------------------------
 -- LangGraph checkpoint 表
 --
--- 不用手写。装好依赖后在 km-agent-runtime/ 下执行:
---     uv run python -c "from langgraph.checkpoint.postgres import PostgresSaver; \
---                       print('ok')"
--- 官方提供了建表脚本, 见 app/graph/agent.py 顶部注释。
+-- 不用手写, 也不用在这里建。Python 服务启动时 app/checkpoint.py 会在
+-- CHECKPOINT_BACKEND=postgres 下调用 AsyncPostgresSaver.setup(), 自动建
+-- checkpoint_migrations / checkpoints / checkpoint_blobs / checkpoint_writes
+-- (setup 是幂等的, 每次启动跑一遍即可)。前提: 连库的 km 用户有 DDL 权限
+-- (compose 里的 km 是库的 owner, 满足)。
 -- 关键点: checkpoint 只用于"Agent 思考流程"的断点恢复,
 --         任务的生命周期状态仍然由 Java 侧 MySQL 说了算。
 -- ------------------------------------------------------------

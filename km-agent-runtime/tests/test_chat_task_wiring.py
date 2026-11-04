@@ -34,7 +34,7 @@ import json
 import httpx
 import pytest
 from fastapi import HTTPException
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 import app.main as main_module
@@ -127,6 +127,18 @@ def _llm_result() -> LLMResult:
     )
 
 
+class FakeSnapshot:
+    """aget_state 的最小返回形状。
+
+    只实现 plan_invocation 用到的两个字段 (values / next) —— 真实
+    StateSnapshot 还有 config、metadata、created_at 等, 这里不需要。
+    """
+
+    def __init__(self, messages: list | None = None, next_nodes: tuple = ()) -> None:
+        self.values = {"messages": list(messages or [])}
+        self.next = tuple(next_nodes)
+
+
 class FakeAgent:
     """假的 ReAct 图。
 
@@ -137,15 +149,37 @@ class FakeAgent:
     start / end 成对 fire 并且带 run_id: 耗时和"哪个工具"全靠 run_id 配对,
     而审计是在 end 里上报的 —— 只 fire start 的话审计那边一条事件都不会
     产生, 表现是"审计是空的", 看起来像代码坏了, 其实只是假 Agent 不够真。
+
+    ``messages`` / ``next_nodes`` 用来伪造 thread 的 checkpoint 快照,
+    覆盖 /chat 的三种处置 (fresh / resume / replay); 默认空 snapshot
+    等价于"全新 thread", 老用例的行为不变。
     """
 
-    def __init__(self, reply: str = "订单 SO20260901001 已发货", raise_exc: Exception | None = None):
+    def __init__(
+        self,
+        reply: str = "订单 SO20260901001 已发货",
+        raise_exc: Exception | None = None,
+        *,
+        messages: list | None = None,
+        next_nodes: tuple = (),
+        state_error: Exception | None = None,
+    ):
         self.reply = reply
         self.raise_exc = raise_exc
         self.configs: list[dict] = []
+        # ainvoke 收到的 payload。None = 空输入续跑, 断言直接看它。
+        self.payloads: list[dict | None] = []
+        self.snapshot = FakeSnapshot(messages, next_nodes)
+        self.state_error = state_error
 
-    async def ainvoke(self, payload: dict, config: dict | None = None) -> dict:
+    async def aget_state(self, config: dict | None = None) -> FakeSnapshot:
+        if self.state_error is not None:
+            raise self.state_error
+        return self.snapshot
+
+    async def ainvoke(self, payload: dict | None, config: dict | None = None) -> dict:
         self.configs.append(config or {})
+        self.payloads.append(payload)
         for handler in (config or {}).get("callbacks") or []:
             await handler.on_llm_start({}, ["hi"], run_id="llm-1")
             await handler.on_llm_end(_llm_result(), run_id="llm-1")
@@ -803,4 +837,96 @@ def test_入口校验失败时既不发心跳也不留存活登记(wired):
     assert fake.beaters == [], "校验没过却已经把心跳跑起来了"
     assert fake.heartbeats == []
     assert created == []
+
+
+# ----------------------------------------------------------------------
+#  断点续跑 —— checkpoint 决定这一轮的输入
+# ----------------------------------------------------------------------
+#
+#  判据本身在 tests/test_checkpoint.py 里单独验; 这里验的是接线:
+#  plan_invocation 的结论有没有真的变成 ainvoke 的入参, 以及那个
+#  "只统计本轮新消息"的切片有没有生效。
+
+
+def test_全新thread时追加用户消息(wired):
+    agent = FakeAgent()
+    post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert agent.payloads == [{"messages": [{"role": "user", "content": "查订单"}]}]
+
+
+def test_任务链路有挂起节点时用空输入续跑(wired):
+    """重试派发的还是同一句话; 再追加一遍就是同一个问题问两遍。"""
+    agent = FakeAgent(
+        messages=[HumanMessage(content="查订单")],
+        next_nodes=("agent",),
+    )
+    resp = post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert resp.status_code == 200
+    assert agent.payloads == [None], "有待执行节点, 却当成新对话重新问了"
+    # 历史里那条工具调用属于上一轮, 不能算进这一轮的响应
+    assert resp.json()["tool_calls"] == []
+
+
+def test_任务链路已完成时只复述结果不再执行(wired):
+    """图跑完、但终态上报丢了 —— 重试应当取回原答案, 而不是再花一次 LLM。"""
+    fake, _ = wired
+    agent = FakeAgent(
+        messages=[HumanMessage(content="查订单"), AIMessage(content="上一次的答案")],
+        next_nodes=(),
+    )
+    resp = post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert agent.payloads == [None]
+    assert resp.status_code == 200
+    assert resp.json()["tool_calls"] == []
+    # replay 也走完整的终态上报: Java 那边正是缺这一条
+    assert fake.statuses()[-1] == COMPLETED
+
+
+def test_自由对话里已完成的历史不触发复述(wired):
+    """同一个 thread_id 的第二句话是一次新提问, 不能拿上一轮的答案糊弄。"""
+    agent = FakeAgent(
+        messages=[HumanMessage(content="你好"), AIMessage(content="你好, 有什么可以帮你")],
+        next_nodes=(),
+    )
+    post_chat(agent, {"message": "查订单", "thread_id": "free-1"})
+
+    assert agent.payloads == [{"messages": [{"role": "user", "content": "查订单"}]}]
+
+
+def test_自由对话里新问题不会被挂起状态吞掉(wired):
+    """★ 空输入续跑会忽略这次带来的消息 ★
+
+    挂起的还是上一个问题, 用户已经问了新的。此时必须追加新消息,
+    LangGraph 会在新输入的基础上重跑挂起节点。
+    """
+    agent = FakeAgent(
+        messages=[HumanMessage(content="旧问题")],
+        next_nodes=("agent",),
+    )
+    post_chat(agent, {"message": "新问题", "thread_id": "free-2"})
+
+    assert agent.payloads == [{"messages": [{"role": "user", "content": "新问题"}]}]
+
+
+def test_自由对话里重发同一句话才续跑(wired):
+    """客户端超时重发 /chat 是最常见的崩溃恢复方式, 不能因此问两遍。"""
+    agent = FakeAgent(
+        messages=[HumanMessage(content="同一个问题")],
+        next_nodes=("agent",),
+    )
+    post_chat(agent, {"message": "同一个问题", "thread_id": "free-3"})
+
+    assert agent.payloads == [None]
+
+
+def test_读不到checkpoint时按新对话处理(wired):
+    """记忆后端抖动不能让本来能跑的请求变成 500。"""
+    agent = FakeAgent(state_error=RuntimeError("postgres 抖了一下"))
+    resp = post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert resp.status_code == 200
+    assert agent.payloads == [{"messages": [{"role": "user", "content": "查订单"}]}]
     assert not main_module.LIVENESS.is_alive(TRACE_ID + "-wrong"), "失败的请求在存活登记里留下了残留"

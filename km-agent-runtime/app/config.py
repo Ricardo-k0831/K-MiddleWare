@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     # 生产用 AUDIT_INGEST_TOKEN 环境变量覆盖, 和 Java 的 KM_AUDIT_INGEST_TOKEN 配对。
     audit_ingest_token: str = "dev-audit-token-change-me"
 
+    # ---------- 对话记忆 (LangGraph checkpointer) ----------
+    # memory = 进程内 (重启即丢, 开发/测试用); postgres = 落在下面的 PostgreSQL,
+    # 支持断点续跑。默认 memory —— 改变持久化语义是显式决定, 见 app/checkpoint.py。
+    checkpoint_backend: str = "memory"
+    # 连接池上限。1 是够用的下限 (uvicorn 单进程 + 每个请求一次 checkpoint 读写),
+    # 真压测时再调; 配成 0 会让池永远拿不到连接, 这里在装配时兜了一层。
+    postgres_pool_max_size: int = 4
+
     # ---------- PostgreSQL ----------
     postgres_host: str = "localhost"
     postgres_port: int = 5432
