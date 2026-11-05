@@ -130,13 +130,20 @@ def _llm_result() -> LLMResult:
 class FakeSnapshot:
     """aget_state 的最小返回形状。
 
-    只实现 plan_invocation 用到的两个字段 (values / next) —— 真实
-    StateSnapshot 还有 config、metadata、created_at 等, 这里不需要。
+    只实现 plan_invocation 用到的三个字段 (values / next / metadata)。
+    metadata 是"这个快照由哪个任务写下"的归属信息 —— 会话线程下,
+    它是区分"续自己的跑"和"接管别人的跑"的唯一依据。
     """
 
-    def __init__(self, messages: list | None = None, next_nodes: tuple = ()) -> None:
+    def __init__(
+        self,
+        messages: list | None = None,
+        next_nodes: tuple = (),
+        metadata: dict | None = None,
+    ) -> None:
         self.values = {"messages": list(messages or [])}
         self.next = tuple(next_nodes)
+        self.metadata = dict(metadata or {})
 
 
 class FakeAgent:
@@ -163,23 +170,42 @@ class FakeAgent:
         messages: list | None = None,
         next_nodes: tuple = (),
         state_error: Exception | None = None,
+        metadata: dict | None = None,
     ):
         self.reply = reply
         self.raise_exc = raise_exc
         self.configs: list[dict] = []
         # ainvoke 收到的 payload。None = 空输入续跑, 断言直接看它。
         self.payloads: list[dict | None] = []
-        self.snapshot = FakeSnapshot(messages, next_nodes)
+        self.snapshot = FakeSnapshot(messages, next_nodes, metadata)
         self.state_error = state_error
+        # 取消测试用: 非 None 时 ainvoke 卡在这里, 直到测试放行或被取消。
+        # 不这么做就造不出"运行中"这个窗口 —— 取消接口的价值恰恰在于
+        # 能打断一段正在跑的 ainvoke。
+        self.gate: asyncio.Event | None = None
+        self.entered = asyncio.Event()
+        # aupdate_state 调用记录: (config, values, as_node)
+        self.updates: list[tuple] = []
 
     async def aget_state(self, config: dict | None = None) -> FakeSnapshot:
         if self.state_error is not None:
             raise self.state_error
         return self.snapshot
 
+    async def aupdate_state(self, config: dict, values: dict, *, as_node: str | None = None):
+        """收尾挂起时被调用的那个接口。真图的语义是先挂起、后重算 next。"""
+        self.updates.append((config, values, as_node))
+        self.snapshot.values["messages"] = list(self.snapshot.values.get("messages") or [])
+        self.snapshot.values["messages"].extend(values.get("messages") or [])
+        self.snapshot.next = ()
+        return config
+
     async def ainvoke(self, payload: dict | None, config: dict | None = None) -> dict:
         self.configs.append(config or {})
         self.payloads.append(payload)
+        self.entered.set()
+        if self.gate is not None:
+            await self.gate.wait()
         for handler in (config or {}).get("callbacks") or []:
             await handler.on_llm_start({}, ["hi"], run_id="llm-1")
             await handler.on_llm_end(_llm_result(), run_id="llm-1")
@@ -416,12 +442,47 @@ def test_成功路径也会排空队列(wired):
 # ----------------------------------------------------------------------
 
 
-def test_task_id同时就是thread_id(wired):
-    """两者本就是同一个东西 —— 共用 ID 是断点续跑不需要映射表的前提。"""
+def test_没有session时任务线程带task前缀(wired):
+    """没有会话身份时退回"记忆按任务隔离": thread 由 task_id 决定。"""
     agent = FakeAgent()
     post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID, "thread_id": "另一个值"})
 
-    assert agent.configs[0]["configurable"]["thread_id"] == TASK_ID
+    assert agent.configs[0]["configurable"]["thread_id"] == f"task:{TASK_ID}"
+
+
+def test_有session时任务落在会话线程并带归属metadata(wired):
+    """★ 这是会话记忆的接线点 ★
+
+    thread 由 session 决定 (同一会话的多个任务共享上下文), 任务身份退居
+    metadata —— 续跑/复述的归属判断全靠它。
+    """
+    agent = FakeAgent()
+    post_chat(agent, {
+        "message": "查订单",
+        "session_id": "s-1",
+        "tenant_id": "km",
+        "task_id": TASK_ID,
+        "trace_id": TRACE_ID,
+        "thread_id": "被忽略的值",
+    })
+
+    config = agent.configs[0]
+    assert config["configurable"]["thread_id"] == "session:km:s-1"
+    assert config["metadata"] == {
+        "task_id": TASK_ID,
+        "trace_id": TRACE_ID,
+        "session_id": "s-1",
+    }
+
+
+def test_自由对话的会话线程不带任务归属(wired):
+    """没有 task_id 时不写 metadata —— plan_invocation 靠这个区分"无归属的挂起"。"""
+    agent = FakeAgent()
+    post_chat(agent, {"message": "你好", "session_id": "s-2", "tenant_id": "km"})
+
+    config = agent.configs[0]
+    assert config["configurable"]["thread_id"] == "session:km:s-2"
+    assert "metadata" not in config
 
 
 def test_任务链路会挂上状态和审计两个callback(wired):
@@ -446,7 +507,7 @@ def test_响应回显task_id(wired):
     body = resp.json()
 
     assert body["task_id"] == TASK_ID
-    assert body["thread_id"] == TASK_ID, "响应里的 thread_id 应该是生效的那个"
+    assert body["thread_id"] == f"task:{TASK_ID}", "响应里的 thread_id 应该是生效的那个"
     assert body["tool_calls"] == ["get_order_by_id"]
 
 
@@ -860,6 +921,7 @@ def test_任务链路有挂起节点时用空输入续跑(wired):
     agent = FakeAgent(
         messages=[HumanMessage(content="查订单")],
         next_nodes=("agent",),
+        metadata={"task_id": TASK_ID},
     )
     resp = post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
 
@@ -875,6 +937,7 @@ def test_任务链路已完成时只复述结果不再执行(wired):
     agent = FakeAgent(
         messages=[HumanMessage(content="查订单"), AIMessage(content="上一次的答案")],
         next_nodes=(),
+        metadata={"task_id": TASK_ID},
     )
     resp = post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
 
@@ -930,3 +993,142 @@ def test_读不到checkpoint时按新对话处理(wired):
     assert resp.status_code == 200
     assert agent.payloads == [{"messages": [{"role": "user", "content": "查订单"}]}]
     assert not main_module.LIVENESS.is_alive(TRACE_ID + "-wrong"), "失败的请求在存活登记里留下了残留"
+
+
+def test_会话线程被别的任务占着时返回409(wired):
+    """★ 会话共享 ≠ 执行可接管 ★
+
+    两个任务落在同一个会话线程里, 后到的那个不能接进前一个任务的半截推理。
+    409 是明确的"现在不行": 调用方可以等, 也不会白花一次 LLM 的钱。
+    """
+    _, created = wired
+    agent = FakeAgent(
+        messages=[HumanMessage(content="任务A的问题")],
+        next_nodes=("agent",),
+        metadata={"task_id": "task-a"},
+    )
+    resp = post_chat(agent, {
+        "message": "任务B的问题",
+        "session_id": "s-busy",
+        "tenant_id": "km",
+        "task_id": TASK_ID,
+        "trace_id": TRACE_ID,
+    })
+
+    assert resp.status_code == 409
+    assert "task-a" in resp.json()["detail"], "报错要说清被谁挡住了"
+    assert agent.payloads == [], "BUSY 时绝不能调用图"
+    # 即使 409, 已启动的旁路也要收尾 —— 否则心跳线程会留在后台
+    assert created[0].aclosed
+
+
+def test_会话里上一个任务的答案不会被新任务复述(wired):
+    """新任务进入会话时, 最后一条 AI 消息是【上一个任务】的答案。
+
+    它可以进上下文 (会话记忆), 但绝不能当作本次的结果直接返回。
+    """
+    agent = FakeAgent(
+        messages=[HumanMessage(content="任务A"), AIMessage(content="任务A的答案")],
+        metadata={"task_id": "task-a"},
+    )
+    resp = post_chat(agent, {
+        "message": "查订单",
+        "session_id": "s-replay",
+        "tenant_id": "km",
+        "task_id": TASK_ID,
+        "trace_id": TRACE_ID,
+    })
+
+    assert resp.status_code == 200
+    assert agent.payloads == [{"messages": [{"role": "user", "content": "查订单"}]}]
+    # 新任务自己的答复由 FakeAgent 产出; 绝不能是上一个任务的答案
+    assert resp.json()["reply"] != "任务A的答案"
+
+
+# ----------------------------------------------------------------------
+#  取消 —— 停掉正在跑的 ainvoke, 并释放会话线程
+# ----------------------------------------------------------------------
+
+
+def test_取消接口停掉正在跑的运行(wired):
+    """★ 取消必须真的打断执行, 不能只改 Java 状态 ★
+
+    否则 LLM 继续花钱、工具继续改数据, 用户看到的"已取消"名不副实。
+    这里用 gate 把 ainvoke 卡住, 制造一个真实的"运行中"窗口, 再打取消。
+    """
+    _fake, _created = wired
+
+    async def _go() -> None:
+        agent = FakeAgent()
+        agent.gate = asyncio.Event()
+        original = main_module.state.agent
+        main_module.state.agent = agent
+        try:
+            transport = httpx.ASGITransport(app=main_module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                chat = asyncio.create_task(client.post("/chat", json={
+                    "message": "查订单",
+                    "task_id": TASK_ID,
+                    "trace_id": TRACE_ID,
+                    "session_id": "s-1",
+                    "tenant_id": "km",
+                }))
+                await asyncio.wait_for(agent.entered.wait(), timeout=2.0)
+                assert TASK_ID in main_module._RUNNING, "运行中的 ainvoke 应当被登记"
+
+                resp = await client.post(
+                    f"/tasks/{TASK_ID}/cancel",
+                    json={"session_id": "s-1", "tenant_id": "km", "trace_id": TRACE_ID},
+                )
+                body = resp.json()
+
+                assert resp.status_code == 200, body
+                assert body["stopped"] is True
+                assert body["thread_id"] == "session:km:s-1"
+                # 这个假图没有挂起快照, 所以没有可收尾的东西
+                assert body["released"] is False
+
+                with pytest.raises(asyncio.CancelledError):
+                    await chat
+                assert TASK_ID not in main_module._RUNNING, "取消后登记必须清掉"
+        finally:
+            main_module.state.agent = original
+
+    asyncio.run(_go())
+
+
+def test_取消能收尾没有在跑的挂起(wired):
+    """运行时重启过 / 图早就崩溃了: 内存里没有运行, 但 checkpoint 还占着线程。
+
+    这时取消仍然要能把会话释放出来 —— 否则那个会话再也没有人能解开了
+    (任务已 CANCELLED, 不会被重试, 也就没人会来续跑)。
+    """
+    _fake, _created = wired
+    agent = FakeAgent(
+        messages=[HumanMessage(content="崩掉的问题")],
+        next_nodes=("agent",),
+        metadata={"task_id": TASK_ID},
+    )
+
+    async def _go() -> httpx.Response:
+        original = main_module.state.agent
+        main_module.state.agent = agent
+        try:
+            transport = httpx.ASGITransport(app=main_module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.post(
+                    f"/tasks/{TASK_ID}/cancel",
+                    json={"session_id": "s-1", "tenant_id": "km", "trace_id": TRACE_ID},
+                )
+        finally:
+            main_module.state.agent = original
+
+    body = asyncio.run(_go()).json()
+
+    assert body["stopped"] is False, "没有运行可停"
+    assert body["released"] is True, "挂起必须被收尾"
+    assert len(agent.updates) == 1
+    config, values, as_node = agent.updates[0]
+    assert as_node == "agent", "收尾要以 ReAct 的 agent 节点身份写, 条件边才会判 END"
+    assert config["configurable"]["thread_id"] == "session:km:s-1"
+    assert values["messages"], "必须写入一条终止消息, 否则 next 不会被清空"

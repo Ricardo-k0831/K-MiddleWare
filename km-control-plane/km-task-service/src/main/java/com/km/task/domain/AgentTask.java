@@ -9,30 +9,26 @@ import java.time.LocalDateTime;
 /**
  * 一个 Agent 任务。对应表 {@code agent_task}。
  *
- * <h3>agentTaskId 为什么同时是 LangGraph 的 thread_id</h3>
+ * <h3>任务与 LangGraph 线程: 不是一个 ID, 是一对身份</h3>
  *
- * 这是整个设计里最关键的一个决定。两者本来就是同一个东西 ——
- * "这单业务"和"这张图跑到哪了"。共用一个 ID 的好处:
+ * <p>线程身份由 Python 侧 {@code resolve_thread_id()} 决定, 优先级:
+ * {@code session:<tenantId>:<sessionId>} &gt; {@code task:<agentTaskId>} &gt; 调用方给的
+ * {@code thread_id}。也就是说<b>有会话时线程属于会话, 记忆跨任务累积</b>;
+ * 没有会话时才退化成"一个任务一个线程"。
  *
- * <ul>
- *   <li>断点续跑 = 拿同一个 ID 重新 invoke, <b>不需要任何映射表</b></li>
- *   <li>排查问题时, 一个 ID 同时能在 MySQL 和 LangGraph checkpoint 里查</li>
- * </ul>
+ * <p>任务归属不再靠线程 ID, 而是靠 checkpoint 的 metadata: Python 每次 invoke
+ * 都写入 {@code metadata.task_id}, LangGraph 会把它持久化到每个 checkpoint 上。
+ * 重试时只续跑 metadata.task_id 等于自己的那个挂起, 别人的挂起一律 409
+ * (同一会话里两个任务并行是错误用法, 不该互相接管)。
  *
- * 反面做法是另生成一个 thread_id 存进 {@code checkpoint_ref} ——
- * 多一层映射, 多一处可能不一致的地方, 收益为零。
- * 所以 {@code checkpointRef} 字段现在【故意留空】, 留给将来
- * "一个任务对应多个 checkpoint 分支"的场景。
+ * <p>为什么不用 {@code checkpoint_ns} 把任务隔离在同一线程里:
+ * LangGraph 的 ns 只对子图有效, 根图上传自定义 ns 直接报错
+ * {@code Subgraph xxx not found}; 而且不同 ns 的 messages 互相不可见,
+ * 隔离了也就没有"共享记忆"可言。验证记录见 docs/task-state-machine.md。
  *
- * <h3>代价: 对话记忆按任务隔离, 不是按会话</h3>
- *
- * <p>task_id 就是 thread_id, 意味着"会话"在运行时并不存在: 同一个
- * {@code sessionId} 下的两个任务各有一份独立的 LangGraph 记忆, 第二个任务
- * 看不见第一个任务的上下文。{@code sessionId} 现在只是一个可查询的数据库标签。
- *
- * <p>要做到会话级记忆, thread_id 应当换成 {@code sessionId}, 任务维度用
- * LangGraph 的 {@code checkpoint_ns} 区分 —— 等真需要跨任务上下文时再做。
- * 这里写明, 是为了避免按"同一会话共享记忆"这个错误前提去设计功能。
+ * <p>因此 {@code checkpointRef} 仍然【故意留空】: 线程 ID 可以从本实体
+ * (tenantId / sessionId / agentTaskId) 确定性推出, 不需要任何映射表;
+ * 多存一份反而多一处可能不一致的地方。
  */
 @TableName("agent_task")
 public class AgentTask {
@@ -45,7 +41,12 @@ public class AgentTask {
 
     private String userId;
 
-    /** 会话 ID。跨任务的关联用它 —— 不要用 traceId 把多个任务串起来 */
+    /**
+     * 会话 ID。跨任务的关联用它 —— 不要用 traceId 把多个任务串起来。
+     *
+     * <p>它同时是 LangGraph 线程的输入 (见类注释): 派发 /chat 时必须原样带上,
+     * 否则重试会落到另一个线程上, 断点续跑和会话记忆都会断。
+     */
     private String sessionId;
 
     /**

@@ -102,17 +102,30 @@ Python 只能**上报**，不能**决定**状态。
 | **生命周期** | 技术性，可清理 | 业务性，必须永久保留 |
 | **语义** | "图跑到哪了" | "这单业务办成没有" |
 
-### 连接点：`agent_task_id` 直接用作 LangGraph 的 `thread_id`
+### 连接点：thread = 会话，任务用 checkpoint metadata 标记归属（2026-11-04 改版）
 
-这是整个设计里最关键的一个决定。好处：
+**旧方案**是 `agent_task_id` 直接当 `thread_id`：断点续跑不需要映射表，但代价是
+对话记忆按任务隔离 —— 同一会话里连问两件事，第二个任务看不见第一个的上下文。
 
-- 断点续跑 = **用同一个 `agent_task_id` 重新 invoke**，不需要任何映射表
-- 排查问题时，一个 ID 同时能在 MySQL 和 PG checkpoint 里查
-- `agent_task.checkpoint_ref` 字段因此**暂时不需要**，
-  留给将来"一个任务多个 checkpoint 分支"的场景
+**现方案**把两个身份拆开：
 
-> 反面做法：另生成一个 `thread_id` 并存进 `checkpoint_ref`。
-> 多一层映射，多一处可能不一致的地方，收益为零。
+| 身份 | 用途 | 落在哪 |
+|---|---|---|
+| `session_id` | 对话记忆的单位 | `thread_id = session:<tenant>:<session_id>` |
+| `task_id` | 执行身份（状态、审计、重试） | checkpoint 的 `metadata.task_id` |
+
+优先级（`app/checkpoint.py::resolve_thread_id`）：
+
+- 有 `session_id` → 同一会话的多个任务共享一条消息历史（会话记忆）；
+- 只有 `task_id` → `task:<task_id>`，记忆按任务隔离（兼容"一次任务一次调用"）；
+- 都没有 → 用调用方给的 `thread_id`（缺省 `default`）。
+
+**为什么带租户**：`session_id` 是调用方自己起的名字，只在租户内唯一；不带
+`tenant_id` 的话，两个租户用了同一个 `session_id` 就会读到彼此的对话历史。
+
+**重试怎么仍然不需要映射表**：重试只换 `traceId`，`task_id` 和 `session_id`
+都不变，算出的 thread 一样；归属信息随 checkpoint 走，因此第 N 次执行能被
+识别成"同一任务的续跑"，也不存在把执行位置存进 `agent_task.checkpoint_ref`。
 
 ### 持久化与断点续跑（2026-11-02）
 
@@ -128,19 +141,38 @@ checkpointer 之前固定是 `InMemorySaver`：进程一重启图状态就没了
 默认仍是 memory：改变持久化语义必须是显式决定，和 `km.retry` / `km.heartbeat`
 默认关闭同一个理由。
 
-**重试时怎么"续上"而不是"重跑"**：Java 重试换的是 `traceId`，`task_id` 不变，
-因此第 N 次执行天然落在同一个 thread 上。`/chat` 调用图之前先 `aget_state`
-读快照，按 `snapshot.next` 分三种处置（实现见 `plan_invocation`）：
+**`/chat` 调用图之前先 `aget_state` 读快照，按 `snapshot.next` + 任务归属
+分四种处置**（实现见 `plan_invocation`）：
 
-| 快照 | 处置 | 传给 `ainvoke` 的输入 | 为什么 |
-|---|---|---|---|
-| `next` 非空 | resume | `None` | 有节点没跑完（崩溃/异常都表现为这个）；再追加消息会把同一个问题问两遍 |
-| `next` 空 + 最后一条是 AI 消息（任务链路） | replay | `None` | 图已经跑完，只是终态上报丢了；复述结果，不再花一次 LLM |
-| 其余 | fresh | `{"messages": [...]}` | 首次执行，或 checkpoint 已丢（如 memory 后端重启） |
+| 快照 | 归属（metadata.task_id） | 处置 | 传给 `ainvoke` 的输入 | 为什么 |
+|---|---|---|---|---|
+| `next` 非空 | 就是本次 task | resume | `None` | 重试续跑自己的半截执行；再追加消息会把同一个问题问两遍 |
+| `next` 非空 | 别的 task / 无归属 | **busy（409）** | 不调用 | 不能接管别人的推理过程 |
+| `next` 空 + 最后一条是 AI 消息 | 就是本次 task | replay | `None` | 图已经跑完，只是终态上报丢了；复述结果，不再花一次 LLM |
+| 其余 | — | fresh | `{"messages": [...]}` | 首次执行、新任务、或 checkpoint 已丢（如 memory 后端重启） |
 
-自由对话（不带 `task_id`）只在"重发的正是挂起前最后那条用户消息"时才 resume，
-否则一律 fresh —— 用户在一个挂起的 thread 上问新问题时，空输入续跑会把新消息吞掉
+自由对话（不带 `task_id`）只在"没有任务归属 + 重发的正是挂起前最后那条用户
+消息"时才 resume；挂起状态属于某个任务时一律 409，不去碰正在跑的执行。否则
+一律 fresh —— 用户在一个挂起的 thread 上问新问题时，空输入续跑会把新消息吞掉
 （实测"带新输入 + 有待执行节点"的组合，LangGraph 会先写入新消息再重跑节点）。
+
+> **为什么不用 `checkpoint_ns` 区分任务**（最初的设想）：`checkpoint_ns` 是
+> 子图的命名空间。对根图传一个自造的 ns，`aget_state` 直接
+> `ValueError("Subgraph ... not found")`；而且不同 ns 的 messages 互相隔离，
+> 而会话记忆要的恰恰是共享。两者不可兼得（2026-11-04 实测）。
+>
+> **为什么归属放 metadata 而不是图 state**：它是"谁写下这个快照"的元信息，
+> 不是对话内容；放 state 里会混进模型上下文，也会被消息裁剪逻辑碰到。
+> LangGraph 会把 `config["metadata"]` 持久化到每个 checkpoint，`aget_state`
+> 原样返回。
+
+**同一会话必须串行**：两个任务同时写一个 thread 会互踩分支，最终状态只留下
+一条，另一个任务的对话甚至它的 COMPLETED 上报都像没发生过。运行时用进程内
+`_thread_lock(thread_id)` 把"读快照 → 决策 → 调用"整段串起来。这**只在单实例
+部署下成立**；多实例要换 Postgres advisory lock 或按 `session_id` 分片。被占用的
+会话返回 409，调用方等该任务结束（或心跳兜底关链）后重发。
+
+> 旧 thread（`thread_id = task_id`）不会自动迁移：升级后历史对话记忆从空开始。
 
 > **副作用边界**：resume 重跑的是"未完成的节点"。如果崩溃点在工具调用之后、
 > 结果写回之前，那个工具会被再调一次。有副作用的工具（下单、支付）必须自带
@@ -156,15 +188,18 @@ checkpointer 之前固定是 `InMemorySaver`：进程一重启图状态就没了
   "以为在持久化，其实重启就丢"。
 
 **单实例提醒**：`thread_id="default"` 在 postgres 后端下是一个所有匿名调用共享、
-且跨重启保留的全局线程。生产环境不带 `task_id` 的调用应当显式传 `thread_id`。
+且跨重启保留的全局线程。生产环境不带 `session_id` / `task_id` 的调用应当显式
+传 `thread_id`；`session_id` 则是会话记忆的正常入口。
 
 **Windows 启动要求**：psycopg 的异步连接不支持 Windows 默认的 ProactorEventLoop。
 `--reload` 时 uvicorn 在子进程里用 Selector，所以开发命令照旧；不带 `--reload`
 时必须加 `--loop asyncio:SelectorEventLoop`。漏了的话 `build_checkpointer` 会
 当场给出这条提示（而不是等连接池 10 秒超时）。
 
-会话级记忆仍未实现：要让同一 `session_id` 的多个任务共享上下文，需要
-`thread_id=session_id` + `checkpoint_ns` 区分任务，那是另一项设计变更。
+会话级记忆已按上面的方案落地（`session_id` → thread，`metadata.task_id` →
+归属）。尚未做的两件事：会话历史的长度控制（现在只增不减，需要时用
+`trim_messages` + `pre_model_hook` 截断送给模型的消息，而不是删 checkpoint），
+以及多实例下的跨进程会话锁。
 
 ---
 
@@ -191,6 +226,7 @@ GET    /api/tasks/{id}/events          状态流转历史
 PATCH  /api/tasks/{id}/status          状态上报（Python 调这个）
 POST   /api/tasks/{id}/heartbeat       执行心跳（Python 调这个）-> 204
 POST   /api/tasks/{id}/retry           失败任务重试      -> 任务（含新 traceId）
+POST   /api/tasks/{id}/cancel          主动取消任务      -> 任务 + 运行时结果
 ```
 
 `PATCH /api/tasks/{id}/status` 请求体：
@@ -391,6 +427,84 @@ mvn -pl km-task-service spring-boot:run
   用户，发起重试的人不记。等接入认证再补。
 - `/chat` 入口会拒绝终态任务（409，提示调用 `/retry`）；这是重试落地时
   一起补的，避免"Agent 白跑一整轮、所有上报都被拒"。
+
+### 取消（2026-11-05）
+
+状态机里 `CANCELLED` 一直存在，但在此之前**没有任何入口** —— 任务卡住只能等
+心跳兜底把它关成 FAILED。取消补上的正是"运维/用户主动停下"这条边。
+
+```
+POST /api/tasks/{id}/cancel       请求体可省略 {"reason": "..."}
+```
+
+#### 允许从哪些状态取消
+
+任何**非终态**（PENDING / THINKING / TOOL_CALLING）。PENDING 是"派发前反悔"，
+另外两个是"跑到一半停掉"。
+
+| 当前状态 | 结果 |
+|---|---|
+| PENDING / THINKING / TOOL_CALLING | 200，任务变 CANCELLED |
+| CANCELLED | 200，**幂等**（不写第二条事件、不再发审计） |
+| COMPLETED / FAILED | 409 `CANCEL_NOT_ALLOWED` |
+
+对已经 CANCELLED 的任务幂等，是因为取消是故障时最可能被连点的按钮；让它
+409 只会制造第二层混乱。
+
+#### 顺序固定：先落库，再通知运行时
+
+1. **Java（一个事务）**：CAS `status -> CANCELLED` + 写 `* -> CANCELLED` 事件
+   （source `JAVA_GATEWAY`）+ 闭掉当前未闭链的 attempt + 发 `TASK_LIFECYCLE`
+   审计（trace 用**被取消那次执行**的，不是任务表上的滚动值）。
+2. **通知 Python** `POST /tasks/{id}/cancel`：停掉正在跑的 `ainvoke`，并把
+   checkpoint 上的挂起状态收尾。
+
+反过来写（先停 Python 再改状态）会有一个窗口：Python 已经停了，任务还是
+THINKING，心跳兜底会把它当"卡住的执行"关掉，随后自动重试又把它拉起来 ——
+用户以为自己已经取消了。
+
+通知失败**不会**让接口失败（仍返回 200，`runtime.reached=false`）：取消的
+业务决定在事务提交时已经生效，Python 的后续上报会因为执行已闭链被 409 拒掉。
+代价只是那次 LLM 调用可能继续跑到自然结束。
+
+#### 为什么 Python 必须收尾 checkpoint
+
+图崩溃/被停时通常挂在 `agent` 节点上（`snapshot.next=('agent',)`）。只要
+`next` 非空，`plan_invocation` 就会对同会话的下一个任务返回 BUSY —— 而这个
+任务已经是 CANCELLED，永远不会有人来续跑它。会话就被一个死任务**永久占住**。
+
+收尾方式（`app/checkpoint.py: release_pending`）：
+
+- 以 `agent` 节点身份写入一条**没有 tool_calls 的 AI 消息**
+  （"上一个任务已被主动取消…"）。ReAct 图的条件边据此判 END，`next` 变空。
+- 不直接删 checkpoint：LangGraph 没有公开的删除 API，而且删掉会连会话历史
+  一起抹掉 —— 取消一个任务不该让整段会话失忆。
+- 只收尾 `metadata.task_id` 等于自己的挂起；别人的挂起不碰。
+- 写完再读一次确认 `next` 真的空了，避免"以为释放了、实际还占着"。
+
+#### 已验过
+
+- 单元：`TaskServiceTest`（状态/事件/闭链/审计 trace、幂等、终态拒绝）、
+  `PythonCancelNotifierTest`（请求体、失败不抛）、`TaskCancellationServiceTest`
+  （先后顺序）、`test_checkpoint.py`（真图收尾 + 归属校验）、
+  `test_chat_task_wiring.py`（真取消一个卡住的 ainvoke）。
+- 真栈（2026-11-05，假模型挂住 30s 制造"正在跑"的窗口）：
+  1. 任务 A（`session:cancel-e2e:s-55bf14a1`）进入 THINKING、`ainvoke` 卡在
+     LLM 调用上 → `POST /api/tasks/{A}/cancel` 返回 200，任务 CANCELLED，
+     `runtime = {reached:true, stopped:true, released:true}`；
+     原 `/chat` 请求连接被直接掐断（客户端拿到空响应体）。
+  2. 事件链 `PENDING -> THINKING (PYTHON_RUNTIME) -> CANCELLED (JAVA_GATEWAY)`；
+     `audit_log` 上同一 trace 的 `CREATED / THINKING / CANCELLED` 三条
+     `TASK_LIFECYCLE` 全部落库，没有断裂。
+  3. 同会话再发任务 B → 200 并 **COMPLETED**（走完一次真实工具调用），
+     证明 `release_pending` 真的把 BUSY 占位清掉了，而不是"取消完就永久 409"。
+  4. 对 A 再取消一次 → 200、状态仍 CANCELLED、`runtime.stopped=false`（幂等路径）。
+
+#### 还没做的
+
+- **多实例**：`_RUNNING` 是进程内登记表，取消请求必须落到持有那个运行的实例上；
+  否则只能收尾 checkpoint，停不掉正在跑的 LLM 调用。
+- **取消原因的操作者身份**：和重试一样，没有鉴权，`actor` 记的是任务归属用户。
 
 ### 心跳兜底（2026-10-31）
 
@@ -628,7 +742,8 @@ Phase 1 是用户**直接**调 Python：
 
 **这是一个架构变化，不是纯增量。** 三个连带影响：
 
-1. `/chat` 需要新增 `task_id` 参数（作为 thread_id 用）
+1. `/chat` 需要新增 `task_id` 参数（执行身份）和 `session_id` 参数（对话记忆
+   的单位；没有时退回 `thread_id = task:<task_id>`）
 2. Python 从"对外服务"变成"内部执行器"，接口可以不再暴露给用户
 3. Phase 2 后期长任务改走 RocketMQ 时，Java 那一步从"同步调 Python"换成"投递 MQ"
 

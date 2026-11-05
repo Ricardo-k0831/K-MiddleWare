@@ -407,8 +407,11 @@ def run_task_case(client: httpx.Client, case: dict, show_reply: bool) -> bool:
     if task["status"] != "PENDING":
         failures.append(f"新建任务的状态应是 PENDING, 实际 {task['status']!r}")
 
-    # 带 task_id 调 /chat —— 刻意【不传 thread_id】: task_id 自己就是 thread_id。
-    # trace_id / tenant_id / actor 必须从建任务响应里原样转交: 带 task_id 却缺
+    # 带 task_id + session_id 调 /chat —— 刻意【不传 thread_id】: 线程身份由
+    # 会话和任务推出来 (session:<tenant>:<sid> > task:<id>), 不需要调用方操心。
+    # 这里必须把 sessionId 原样转交, 否则这次运行落在任务线程上, 和 Java 重试
+    # 派发的线程 (带 session_id) 对不上, 断点续跑就接不起来。
+    # trace_id / tenant_id / actor 同理必须从建任务响应里转交: 带 task_id 却缺
     # trace_id 会被入口直接 400, 而且缺了它这次运行的所有上报都归不了位。
     print(f"问: {case['message']}")
     try:
@@ -417,6 +420,7 @@ def run_task_case(client: httpx.Client, case: dict, show_reply: bool) -> bool:
             json={
                 "message": case["message"],
                 "task_id": task_id,
+                "session_id": task.get("sessionId"),
                 "trace_id": task["traceId"],
                 "tenant_id": task.get("tenantId"),
                 "actor": task.get("userId"),

@@ -642,6 +642,23 @@ trace 488db1d0: FAILED -> PENDING (attemptNo=2, previousTraceId=364a280c)
 推出前后关系），冗余在这里是值得的：审计是旁路，查一条链的来历不该再要求
 联表。注意它只用于**链与链之间**的父子关系，跨任务仍然只用 `task_id`。
 
+**取消也发一条 TASK_LIFECYCLE，盖的是被取消那次执行的 trace。** 形状仍是
+`{"from":"THINKING","to":"CANCELLED","source":"JAVA_GATEWAY","detail":{...}}`。
+trace 同样取自 `agent_task_attempt`（未闭链那条，或刚闭掉的那条），**不能**用
+`agent_task.trace_id` —— 取消发生在执行中途时两者恰好相同，一旦这条任务重试
+过，滚动值已经指向新链，用它会把这个 CANCELLED 盖到新链头上，造成"新链还没
+开跑就被取消"的假象。于是被取消的链在审计里是闭合的：
+
+```
+trace 5905c357: 创建 -> THINKING -> CANCELLED (source=JAVA_GATEWAY, detail.reason=…)
+```
+
+取消不额外产生一条 `AGENT_RUNTIME` 审计：Python 侧那个 `ainvoke` 是被
+`task.cancel()` 掐断的，`CancelledError` 是 `BaseException`，运行时的异常上报
+路径（只捕 `Exception`）不会为它生成事件。这是有意的——取消的"事实源"是
+Java 这一次 CAS，运行时到没到、停没停由 `/cancel` 响应里的 `runtime` 三个
+布尔值回答，而不是靠一条可能永远发不出来的审计。
+
 ### ★ 4. `occurred_at` 的定义——这条是端到端跑出来才发现的 ★
 
 第一版把 `occurred_at` 写成了**回调结束的时刻**，端到端一比就露馅了：
@@ -936,10 +953,13 @@ AUDIT_INGEST_TOKEN=dev-audit-token-change-me
    CANCELLED 时直接 409，并提示去调 `/retry`。没有这条的话，Agent 会白跑一整轮，
    而 Java 会拒掉它产生的每一条上报和审计。
 
-7. **「会话」只有数据库维度，没有运行时维度。** `/chat` 里 `thread_id = task_id`，
-   所以 LangGraph 的记忆按**任务**隔离：同一会话里的第二个任务看不见第一个任务的
-   上下文。要做会话级记忆，得把 `thread_id` 换成 `session_id`，用 LangGraph 的
-   `checkpoint_ns` 区分任务。当前 `session_id` 只是一个能被查询的标签。
+7. **「会话」已经有运行时维度（2026-11-04 修订）。** 旧版 `/chat` 里
+   `thread_id = task_id`，记忆按任务隔离，`session_id` 只是数据库标签。现在
+   `session_id` 是记忆的单位（`thread_id = session:<tenant>:<session_id>`），
+   任务改由 checkpoint 的 `metadata.task_id` 标记归属 —— 用来区分"续自己的跑"
+   和"接管别人的跑"。`checkpoint_ns` 不能用于这个目的：它是子图命名空间，
+   根图传自造的 ns 会 `ValueError("Subgraph ... not found")`，且不同 ns 的
+   消息互相隔离。细节见 `docs/task-state-machine.md` 第三节。
 
 8. **审计摄入的可用性参数还是常量。** 500ms 截止、5 秒熔断、2 线程 / 32 队列
    都写在 `GuardedAttemptLookup` 里。现在够用，但这几个值取决于机器和流量，

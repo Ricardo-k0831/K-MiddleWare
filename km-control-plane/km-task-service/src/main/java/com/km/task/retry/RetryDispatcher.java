@@ -125,9 +125,16 @@ public class RetryDispatcher {
         try {
             restClient.post()
                     .uri("/chat")
-                    // thread_id 用 task_id: 一次执行就是一个独立会话。
-                    // 重试是同一条任务的新执行, 但绝不能继承上一遍的对话上下文 ——
-                    // 上一遍的失败过程 (报错、半截工具结果) 会污染这一遍的判断。
+                    // ★ session_id 必须带上 ★ 它是 Python 侧算会话线程的输入
+                    // (thread = session:<tenant>:<session_id>)。
+                    //
+                    // 不带 session_id 的话, Python 退回"按任务隔离"的线程,
+                    // 重试虽然还能续跑, 但会看不到同一会话里其他任务的上下文 ——
+                    // 会话级记忆就名存实亡了。
+                    //
+                    // 续跑的安全性由 Python 侧的 metadata.task_id 把关:
+                    // 只有"挂起的正是这个 task"才续, 别的任务的半截执行会 409,
+                    // 所以这里不需要再防"重试继承了不该继承的上下文"。
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(payload(task))
                     .retrieve()
@@ -178,8 +185,12 @@ public class RetryDispatcher {
         // message 用的还是最初的 intent: 重试 = 把同一件事再做一遍。
         // 不能用 error_msg / result 拼一个新提示 —— 那等于换了个任务。
         body.put("message", task.getIntent());
+        // thread_id 仍然给一份 task_id: Python 只有在 session_id 缺失时才用它。
+        // session_id 有值的正常路径下, 这个字段会被忽略 —— 保留是为了让
+        // 老版本 Python / 手工调用这条请求时行为仍然确定, 而不是落到 "default"。
         body.put("thread_id", task.getAgentTaskId());
         body.put("task_id", task.getAgentTaskId());
+        body.put("session_id", task.getSessionId());
         body.put("trace_id", task.getTraceId());
         body.put("tenant_id", task.getTenantId());
         body.put("actor", task.getUserId());
@@ -239,9 +250,30 @@ public class RetryDispatcher {
         return root.getClass().getSimpleName() + ": " + root.getMessage();
     }
 
-    private static RestClient buildClient(RestClient.Builder builder,
-                                          RetryProperties.Dispatch config) {
+    /**
+     * ★ 必须显式用 HTTP/1.1 ★
+     *
+     * <p>E2E 实测 (2026-11-04): 用默认构造的 {@link HttpClient} 派发, Python 侧
+     * <b>每一次</b>都回 422 {@code {"loc":["body"],"msg":"Field required"}}, 而同一
+     * 时刻 curl 直连 /chat 完全正常。uvicorn 的日志把原因写得很清楚:
+     * {@code WARNING: Unsupported upgrade request.} 紧跟
+     * {@code WARNING: Invalid HTTP request received.}
+     *
+     * <p>JDK HttpClient 默认 {@code HTTP_2}, 而目标是明文 {@code http://}, 于是它会先
+     * 发一个 h2c 升级请求 ({@code Upgrade: h2c} + {@code Connection: Upgrade})。
+     * uvicorn/h11 不支持这种升级, 直接丢掉请求体; FastAPI 看到的就是"没有 body"。
+     * 被丢掉的 chunk 字节还会被当成下一条请求行 —— 那条 "Invalid HTTP request"
+     * 就是这么来的。和"手工假服务器不处理 chunked"是同一个失败形状:
+     * 症状出在别处, 真正的原因在传输层。
+     *
+     * <p>改回 HTTP/1.1 后不再有升级协商, 普通 chunked 请求 uvicorn 处理得很好
+     * (已用 curl 验证)。别为了让"看起来更快"把它改回 HTTP_2: 对 h2c 明文,
+     * 这里只有坏处。
+     */
+    static RestClient buildClient(RestClient.Builder builder,
+                                  RetryProperties.Dispatch config) {
         HttpClient http = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofSeconds(config.getConnectTimeoutSeconds()))
                 .build();
         JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(http);

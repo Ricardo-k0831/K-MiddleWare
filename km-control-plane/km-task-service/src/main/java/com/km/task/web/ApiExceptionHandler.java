@@ -1,5 +1,6 @@
 package com.km.task.web;
 
+import com.km.task.error.CancellationNotAllowedException;
 import com.km.task.error.ExecutionMismatchException;
 import com.km.task.error.IllegalTaskTransitionException;
 import com.km.task.error.MaxRetryExceededException;
@@ -88,6 +89,19 @@ public class ApiExceptionHandler {
      * 也不是调用方的逻辑错误 —— 如果在这里刷 WARN, 一个卡在失败循环里的
      * 任务会把日志刷满, 反而遮住真正需要看的那条。
      */
+    /**
+     * 取消被拒 (任务已 COMPLETED / FAILED, 或并发冲突)。
+     *
+     * <p>和重试一样是 409 —— 报文没问题, 是任务当前状态不允许。
+     * 注意"已经 CANCELLED"不走这里: 那是幂等成功 (200)。
+     */
+    @ExceptionHandler(CancellationNotAllowedException.class)
+    public ResponseEntity<ApiError> handleCancellationNotAllowed(CancellationNotAllowedException ex) {
+        log.warn("取消被拒: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiError("CANCEL_NOT_ALLOWED", ex.getMessage()));
+    }
+
     @ExceptionHandler(MaxRetryExceededException.class)
     public ResponseEntity<ApiError> handleMaxRetryExceeded(MaxRetryExceededException ex) {
         log.info("重试次数用尽: {}", ex.getMessage());

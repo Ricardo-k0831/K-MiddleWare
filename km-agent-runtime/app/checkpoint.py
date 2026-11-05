@@ -56,10 +56,53 @@ BACKEND_MEMORY = "memory"
 BACKEND_POSTGRES = "postgres"
 _SUPPORTED_BACKENDS = (BACKEND_MEMORY, BACKEND_POSTGRES)
 
-# 一次 /chat 对图的三种处置, 见 plan_invocation。
+# 一次 /chat 对图的四种处置, 见 plan_invocation。
 MODE_FRESH = "fresh"    # 追加新消息, 开新一轮
 MODE_RESUME = "resume"  # 空输入, 让图从挂起的节点继续
 MODE_REPLAY = "replay"  # 空输入, 图已经跑完 —— 只把结果再交一次
+MODE_BUSY = "busy"      # 这个 thread 上有【别的任务】没跑完, 拒绝这次请求
+
+# 线程身份的前缀。前缀不是装饰: 会话 id 和任务 id 都可能由调用方提供,
+# 没有任何约束保证两者不会撞上。带上前缀之后, "这是会话线程还是任务线程"
+# 从 thread_id 本身就能看出来, 排查时不用再去翻请求日志。
+THREAD_SESSION_PREFIX = "session:"
+THREAD_TASK_PREFIX = "task:"
+
+# 解析 thread_id
+def resolve_thread_id(
+    *,
+    session_id: str | None = None,
+    tenant_id: str | None = None,
+    task_id: str | None = None,
+    thread_id: str | None = None,
+) -> str:
+    """把请求里的几种身份解析成 LangGraph 的 thread_id。
+
+    优先级: ``session_id`` > ``task_id`` > 调用方自带的 ``thread_id``。
+
+    * **有 session_id** —— 对话记忆按【会话】累积, 同一会话里的多个任务
+      共享上下文。这是默认的、也是推荐的用法。
+    * **只有 task_id** —— 兼容"外部系统一次任务一次调用"的场景: 记忆按任务
+      隔离, 任务之间互不可见。
+    * **两个都没有** —— 完全由调用方指定的 thread_id 决定 (缺省 ``default``)。
+
+    ★ 为什么会话线程要带 tenant_id ★
+
+    ``session_id`` 是调用方自己生成的 (比如 ``s-99b4d0a2``), 只在租户内部
+    唯一。如果直接用 ``session:<sid>``, 两个租户恰好用了同一个 session_id
+    就会读到彼此的对话历史 —— 这不是理论风险, 而是"客户端随便起个名字"
+    这种最常见用法的必然后果。租户是会话的天然隔离边界, 必须进 key。
+
+    任务线程不需要租户前缀: ``task_id`` 是 Java 侧生成的 UUID, 全局唯一。
+    """
+    session = (session_id or "").strip()
+    if session:
+        tenant = (tenant_id or "").strip() or "-"
+        return f"{THREAD_SESSION_PREFIX}{tenant}:{session}"
+    task = (task_id or "").strip()
+    if task:
+        return f"{THREAD_TASK_PREFIX}{task}"
+    return (thread_id or "").strip() or "default"
 
 
 @dataclass
@@ -210,10 +253,11 @@ class InvocationPlan:
     # ainvoke(None) 不是"什么都不做"，而是"别给新输入，沿着已存的 checkpoint 往下走"
     payload: dict[str, Any] | None
 
-    # 调用模式, 可选值: FRESH, RESUME,REPLAY,
+    # 调用模式, 可选值: FRESH, RESUME, REPLAY, BUSY
     # FRESH:  新输入, 从头开始
     # RESUME: 继续上一遍的未完成节点
     # REPLAY: 重复上一遍的结果
+    # BUSY:   这个 thread 上挂着别的任务, 本次请求必须被拒绝
     mode: str
 
     # 调用新的ainvoke之前, 历史 messages 的条数
@@ -222,6 +266,10 @@ class InvocationPlan:
     #挂起节点的名称列表
     #只在 RESUME模式下有值
     pending_nodes: tuple[str, ...] = ()
+
+    # BUSY 时, 占着这个 thread 的任务 id (没有归属时是 None)。
+    # 回给调用方是为了让 409 的报错能说清"被谁挡住了"。
+    busy_task_id: str | None = None
 
     @property
     def resumes(self) -> bool:
@@ -233,36 +281,49 @@ async def plan_invocation(
     config: dict[str, Any],
     message: str,
     *,
-    task_scoped: bool,
+    task_id: str | None = None,
 ) -> InvocationPlan:
-    """读一次 checkpoint, 决定"续跑 / 复述结果 / 开新一轮"。
+    """读一次 checkpoint, 决定"续跑 / 复述结果 / 开新一轮 / 拒绝"。
 
-    ★ 为什么必须区分这三种, 不能一律追加消息 ★
+    ★ 会话线程下, 判断依据多了一个: 这个快照是【哪个任务】留下的 ★
 
-    重试派发的是**同一件事** (Java 侧 message 始终是 task.intent)。
-    如果每次都追加一条 user 消息:
+    对话记忆现在按会话累积 (thread_id = ``session:<tenant>:<sid>``), 同一个
+    thread 里会先后出现多个任务。只看 ``snapshot.next`` 已经不够了:
 
-    * 图停在半路 (进程被杀 / 节点抛错) 时, 那条消息已经在 checkpoint 里,
-      再追加就是同一个问题问两遍 —— LLM 看到两段一模一样的上下文;
-    * 图其实已经跑完、只是终态上报丢了时, 会白白再花一次 LLM 的钱,
-      而且答案可能不一样 —— 同一个任务两次执行给出两个答案。
+    * 任务 A 崩在半路, 任务 B 进入同一会话 —— B 不能"续跑" A 的节点,
+      那会把 B 的消息接进 A 的推理过程;
+    * 任务 A 跑完了, 任务 B 进来 —— 最后一条确实是 AI 消息, 但那是 A 的
+      答案, 复述给 B 等于答非所问, 还省掉了 B 本该花的那次调用。
 
-    LangGraph 对这两种情况都有现成能力: ``ainvoke(None)`` 对挂起的图会
-    沿着未执行的 super-step 继续; 对已完成的线程则原样返回最终状态
-    (一个节点都不跑)。判断依据只有 ``snapshot.next``:
+    归属信息放在 checkpoint 的 ``metadata`` 里 (``config["metadata"]["task_id"]``),
+    不放进图的 state: 它是"谁写下了这个快照"的元信息, 不是对话内容 ——
+    放 state 里会混进模型上下文, 还会被消息裁剪逻辑碰到。LangGraph 会把
+    config.metadata 持久化到每个 checkpoint 并由 ``aget_state`` 原样返回
+    (2026-11-04 实测)。
 
-    * 非空 → 有节点没跑完 (RESUME)。这也覆盖"进程崩溃" —— checkpoint
-      在节点开始前写, 所以崩溃点一定表现为待执行节点。
-    * 空 + 最后一条是 AI 消息 → 上一遍已经给出答复 (REPLAY)。
-      只对任务链路这么做: 自由对话里用户重发同一句话是一次新提问。
-    * 其余 → 正常追加 (FRESH)。
+    四种结论:
+
+    * 有挂起节点 + 归属就是本次任务 → RESUME (重试续跑)
+    * 有挂起节点 + 归属是别的任务 / 无归属 → BUSY (由 /chat 回 409)
+    * 无挂起 + 归属就是本次任务 + 最后一条是 AI → REPLAY (补终态上报)
+    * 其余 → FRESH (追加消息, 会话记忆自然累积)
+
+    ★ 为什么不用 checkpoint_ns 区分任务 (之前的设想) ★
+
+    ``checkpoint_ns`` 是给【子图】用的命名空间。对根图传一个自造的 ns,
+    ``aget_state`` 直接报 ``Subgraph xxx not found`` (已实测); 就算能写,
+    不同 ns 的 messages 也是互相隔离的 —— 而会话记忆恰恰要求共享。
+    所以"session 线程 + 任务 metadata"是这两个诉求唯一能同时成立的组合。
 
     ★ 自由对话的额外一票否决 ★
 
     自由对话没有"同一件事"的概念。一个 thread 停在半路、用户又发了
     **新问题**时, 空输入续跑会把新消息彻底吞掉。所以只有"重发的正是
-    挂起前最后那条用户消息"时才 RESUME, 否则照常追加 —— 实测这种
-    "带新输入 + 有待执行节点"的组合, LangGraph 会先写入新消息再重跑节点。
+    挂起前最后那条用户消息"时才 RESUME; 而挂起状态如果属于某个任务,
+    自由对话一律 BUSY, 不去碰别人正在跑的执行。
+
+    注意 FRESH 在"有挂起节点"时也成立: LangGraph 会先写入新消息, 再重跑
+    挂起节点 (实测)。这正是自由对话"旧问题崩了, 用户换了个新问题"要的行为。
     """
     #获取指定thread_id 对应的最新的snapshot快照对象
     snapshot, error = await _read_snapshot(agent, config)
@@ -278,11 +339,28 @@ async def plan_invocation(
     messages = _messages(snapshot)
     # 判断未进行下一步之前的历史消息条数
     baseline = len(messages)
+    # 这个快照是哪个任务写下的? None = 自由对话 (没有任务身份)
+    owner = _owner_task(snapshot)
+    wanted = (task_id or "").strip() or None
 
     # 如果有挂起节点
     if pending:
-        # 任务链路 或者 断点后, 历史消息列表里最新的一条用户消息和当前输入相同,
-        if task_scoped or _last_human_content(messages) == message:
+        if wanted is not None:
+            # 任务链路: 只有"同一个任务"的挂起才能续。别的任务的半截执行
+            # 属于另一个推理过程, 接上去就是串味。
+            if owner == wanted:
+                return InvocationPlan(
+                    payload=None,
+                    mode=MODE_RESUME,
+                    baseline_messages=baseline,
+                    pending_nodes=pending,
+                )
+            return _busy(owner, baseline, pending)
+        # 自由对话: 挂起的是某个任务时绝不碰它 —— 那是还在跑/没跑完的执行。
+        if owner is not None:
+            return _busy(owner, baseline, pending)
+        # 没有归属的挂起 = 上一次自由对话崩了。重发同一句话才续跑。
+        if _last_human_content(messages) == message:
             return InvocationPlan(
                 payload=None,
                 mode=MODE_RESUME,
@@ -292,9 +370,10 @@ async def plan_invocation(
         # 用户发起了新的问题. 和挂起前最新的用户消息有所不同
         return _fresh(message, baseline)
 
-    # 任务已经跑完, 属于任务链路且最后一条是 AI 消息, 则重复上一遍的结果
-    if task_scoped and _ends_with_ai(messages):
-        # 同一个任务重试, 而图上一次已经跑出了答复 —— 别再问一遍 LLM。
+    # 同一个任务重试, 而图上一次已经跑出了答复 —— 别再问一遍 LLM。
+    # ★ 必须核对归属 ★ 会话线程里"最后一条是 AI"可能是上一个任务的答案,
+    # 复述给新任务就是答非所问。
+    if wanted is not None and owner == wanted and _ends_with_ai(messages):
         # 直接 ainvoke(None) 取回最终状态, 由 /chat 重新上报 COMPLETED。
         return InvocationPlan(
             payload=None,
@@ -303,6 +382,127 @@ async def plan_invocation(
         )
 
     return _fresh(message, baseline)
+
+
+# 取消任务时写进图里的那条消息。它是"收尾", 不是"回答" —— 措辞要让
+# 下一轮看到这段历史的模型知道: 上一个任务是被主动停掉的, 不是它自己结束的。
+CANCEL_MESSAGE = "上一个任务已被主动取消, 本次执行到此为止。"
+
+# 收尾要借哪个节点的手写进图。``create_react_agent`` 的节点名固定是
+# ``agent`` (另一个是 ``tools``)。这不是"约定俗成", 而是 ReAct 图的路由:
+# 以 agent 身份写入一条【没有 tool_calls 的 AI 消息】, 条件边就会走向 END,
+# 挂起状态随之清空。换自建图时这里要跟着改 —— 所以单独提成常量。
+RELEASE_NODE = "agent"
+
+
+async def release_pending(
+    agent: Any,
+    config: dict[str, Any],
+    *,
+    task_id: str | None = None,
+) -> bool:
+    """把一个任务留下的挂起状态收尾, 让会话线程重新可用。
+
+    ★ 为什么取消必须做这一步 ★
+
+    取消的语义是"这次执行不再继续", 但图可能正挂在 ``agent`` 节点上
+    (崩溃/被停都是这个形态)。只要 ``snapshot.next`` 非空, 同会话的
+    下一个任务就会在 ``plan_invocation`` 里撞到 BUSY —— 线程被一个
+    **永远不会再被续跑**的任务永久占住。所以取消不能只把 Java 侧改成
+    CANCELLED, 还要让 checkpoint 自己"落地"。
+
+    ★ 为什么是"以 agent 身份写一条无 tool_calls 的 AI 消息" ★
+
+    LangGraph 不提供"丢弃挂起"的接口: ``aupdate_state`` 只能以某个节点的
+    身份写状态, 写完之后 ``next`` 由该节点的出边重新计算。以 ``agent``
+    写入空 tool_calls 的消息, 条件边判 END, ``next`` 变成空 —— 图就停在
+    一个正常的终态上, 而不是"半截推理"。
+
+    另一个看起来更简单的做法是直接把 thread 的 checkpoint 删掉, 但那是
+    绕过 checkpointer 的内部表结构 (LangGraph 没有公开的删除 API), 且会
+    连会话历史一起抹掉 —— 取消一个任务不该让整段会话失忆。
+
+    ★ 归属校验 ★
+
+    只收尾"属于 task_id"的挂起。没有归属的挂起 (自由对话) 或别的任务的
+    挂起一律不碰 —— 那不是这次取消该管的事, 误清会让另一个任务的续跑
+    直接丢上下文。
+
+    @return True = 确实收尾了一个挂起; False = 没有挂起 / 归属不符 / 收尾失败
+    """
+    snapshot, error = await _read_snapshot(agent, config)
+    if error is not None:
+        # 读不到就什么也做不了。返回 False 让调用方如实上报"没释放",
+        # 不要假装成功 —— 会话可能仍然被占着。
+        logger.warning("取消时读取 checkpoint 失败: %s", error)
+        return False
+    if snapshot is None:
+        return False
+
+    pending = tuple(getattr(snapshot, "next", None) or ())
+    if not pending:
+        # 没有挂起 = 不需要收尾 (执行已经跑完/还没开始写)。幂等。
+        return False
+
+    owner = _owner_task(snapshot)
+    wanted = (task_id or "").strip() or None
+    if wanted and owner and owner != wanted:
+        logger.warning(
+            "取消时不碰别人的挂起: thread=%s owner=%s task=%s pending=%s",
+            config.get("configurable", {}).get("thread_id"),
+            owner,
+            wanted,
+            pending,
+        )
+        return False
+
+    updater = getattr(agent, "aupdate_state", None)
+    if updater is None:
+        logger.warning("Agent 不支持 aupdate_state, 无法释放挂起状态")
+        return False
+
+    try:
+        await updater(
+            config,
+            {"messages": [AIMessage(content=CANCEL_MESSAGE)]},
+            as_node=RELEASE_NODE,
+        )
+    except Exception as ex:  # noqa: BLE001 - 取消是旁路, 失败只影响"能否立即释放会话"
+        logger.warning("写入取消收尾失败: %s: %s", type(ex).__name__, ex)
+        return False
+
+    # 写完再确认一次 next 真的空了。不确认的话, 如果以后的图结构调整了
+    # (比如 agent 之后还有别的边), 我们会"以为释放了", 而调用方得到的
+    # 409 会变成一句解释不了的"取消成功但会话还被占着"。
+    check, error = await _read_snapshot(agent, config)
+    if error is not None:
+        logger.warning("取消收尾后复查失败: %s", error)
+        return True
+    still_pending = tuple(getattr(check, "next", None) or ())
+    if still_pending:
+        logger.warning("取消收尾后仍有挂起: %s", still_pending)
+        return False
+    return True
+
+
+def _owner_task(snapshot: Any) -> str | None:
+    """快照是由哪个任务写下的; 自由对话/读不到时返回 None。"""
+    metadata = getattr(snapshot, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("task_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _busy(owner: str | None, baseline: int, pending: tuple[str, ...]) -> InvocationPlan:
+    """这个 thread 被别的执行占着 —— 既不能续, 也不能追加。"""
+    return InvocationPlan(
+        payload=None,
+        mode=MODE_BUSY,
+        baseline_messages=baseline,
+        pending_nodes=pending,
+        busy_task_id=owner,
+    )
 
 # 获取 config(thread_id) 对应的最新的snapshot快照对象
 async def _read_snapshot(agent: Any, config: dict[str, Any]) -> tuple[Any, str | None]:
@@ -321,7 +521,9 @@ async def _read_snapshot(agent: Any, config: dict[str, Any]) -> tuple[Any, str |
     try:
         # 去Postgres / 内存 里根据传入的config读取快照, 返回一个StateSnapshot对象
         return await getter(config), None
-    except Exception as ex:  # 降级处理
+    # 这里必须捕获所有异常 (含 psycopg 的连接/序列化错误): 读不到历史只该
+    # 退化成"新对话", 不能让整个 /chat 挂掉。降级是有意的, 不是漏了具体类型。
+    except Exception as ex:  # noqa: BLE001 - 降级处理
         return None, f"{type(ex).__name__}: {ex}"
 
 # 追加新消息, 组装新一轮对话的InvocationPlan对象
@@ -333,12 +535,14 @@ def _fresh(message: str, baseline_messages: int = 0) -> InvocationPlan:
     )
 
 # 从快照中提取消息列表
+# 一个 StateSnapshot 对象大致长这样 (示意, 不是可执行代码 —— 每一行都要注释掉,
+# 否则会被当成模块级赋值, 污染 values / next / config 这些名字):
 #StateSnapshot(
-    values={"messages": [...]},    # 当前对话走到这一步的所有历史消息
-    next=("tools",),               # 下一步需要执行的节点
-    config={...},                  # 内部用，你没用到
-    metadata={"step": 3},          # 内部用，你没用到
-    created_at="2026-11-04T...",   # 内部用，你没用到
+#     values={"messages": [...]},    # 当前对话走到这一步的所有历史消息
+#     next=("tools",),               # 下一步需要执行的节点
+#     config={...},                  # 内部用，你没用到
+#     metadata={"step": 3},          # 内部用，你没用到
+#     created_at="2026-11-04T...",   # 内部用，你没用到
 #)
 def _messages(snapshot: Any) -> list[Any]:
     # 快照里面有一个value字段, values是一个dict, 里面有{"messages": [...]}

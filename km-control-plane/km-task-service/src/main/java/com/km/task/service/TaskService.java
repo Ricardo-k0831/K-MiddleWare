@@ -12,6 +12,7 @@ import com.km.task.domain.AgentTaskEvent;
 import com.km.task.domain.TaskEventSource;
 import com.km.task.domain.TaskStatus;
 import com.km.task.domain.TaskStatusMachine;
+import com.km.task.error.CancellationNotAllowedException;
 import com.km.task.error.ExecutionMismatchException;
 import com.km.task.error.IllegalTaskTransitionException;
 import com.km.task.error.MaxRetryExceededException;
@@ -468,6 +469,132 @@ public class TaskService {
         log.info("任务重试 task={} attemptNo={} newTrace={} previousTrace={} retryCount={}/{} source={}",
                 agentTaskId, nextAttemptNo, newTraceId, previousTraceId,
                 retryCount + 1, maxRetry, source);
+        return updated;
+    }
+
+    // ------------------------------------------------------------------
+    //  取消 —— 控制面的"停下"
+    // ------------------------------------------------------------------
+
+    /**
+     * 主动取消一个任务: 状态置 CANCELLED, 闭掉当前执行, 留下事件与审计。
+     *
+     * <h3>★ 为什么取消必须先写在这里, 再通知 Python ★</h3>
+     *
+     * <p>Java 是任务状态的唯一事实源。如果反过来 (先让 Python 停、再改状态),
+     * 就会出现一个窗口: Python 已经停了, 但任务还是 THINKING —— 心跳兜底
+     * 扫描会把它当成"卡住的执行", 再过一会儿自动重试把它拉起来, 而用户
+     * 以为自己已经取消了。所以顺序固定为: <b>先落库, 后通知</b>。
+     *
+     * <p>通知失败也不回滚: 取消的<b>业务决定</b>已经生效, Python 那次运行
+     * 即使还在跑, 它的后续状态上报也会因为执行已闭链被 409 拒掉。代价只是
+     * "LLM 多跑了一会儿" —— 比"任务被取消后又自动重试"小得多。
+     *
+     * <h3>★ 允许从哪些状态取消 ★</h3>
+     *
+     * <p>任何非终态 (PENDING / THINKING / TOOL_CALLING) 都可以:
+     * PENDING 是"派发前反悔", 另外两个是"跑到一半停掉"。规则由
+     * {@link TaskStatusMachine} 定义, 这里只调用它 —— 取消不是绕过状态机
+     * 的后门。
+     *
+     * <p>对 CANCELLED 幂等: 重复取消返回当前任务, 不写第二条事件、
+     * 不再发审计。取消是运维在故障时最可能连点的按钮, 让它 409 只会制造
+     * 第二层混乱。
+     *
+     * <h3>★ 为什么 CAS 条件里只有 status, 没有 retry_count ★</h3>
+     *
+     * <p>重试的 CAS 要带 retry_count, 因为它的写入会改这个值, 两次并发重试
+     * 必须只成功一次。取消不改 retry_count, 只以 status 作为"我读到的那一版"
+     * 的凭据就够了; 并发输掉的一方复查后发现已经是 CANCELLED, 按幂等返回。
+     *
+     * @param reason 可选的取消原因, 写进事件和审计, 便于事后回答"谁为什么停的"
+     * @return 更新后的任务 (状态 CANCELLED)
+     */
+    @Transactional
+    public AgentTask cancel(String agentTaskId, String reason) {
+        AgentTask task = requireTask(agentTaskId);
+        TaskStatus from = parseStatus(task);
+
+        // 已经取消 = 目标状态。幂等, 不再写事件/审计。
+        if (from == TaskStatus.CANCELLED) {
+            log.debug("重复取消, 忽略 task={}", agentTaskId);
+            return task;
+        }
+        // 其他终态没有可以停的东西。等到这里说明运维/调用方对状态判断有误,
+        // 应当明确拒绝而不是假装成功。
+        if (from.isTerminal()) {
+            throw new CancellationNotAllowedException(agentTaskId,
+                    "任务已结束 (当前状态 " + from + ")");
+        }
+
+        // 当前还没闭链的那次执行。正常情况下恰好一条 (create 时建的那条),
+        // 但防御性地按"查不到也能取消"处理: 数据不一致时, 让它停在
+        // THINKING 比取消不动它更糟。
+        AgentTaskAttempt attempt = attemptMapper.selectOne(
+                Wrappers.<AgentTaskAttempt>lambdaQuery()
+                        .eq(AgentTaskAttempt::getAgentTaskId, agentTaskId)
+                        .isNull(AgentTaskAttempt::getEndedAt)
+                        .last("LIMIT 1"));
+
+        String trimmedReason = isBlank(reason) ? null : reason.trim();
+        LocalDateTime now = LocalDateTime.now();
+
+        int affected = taskMapper.update(null, Wrappers.<AgentTask>lambdaUpdate()
+                .eq(AgentTask::getAgentTaskId, agentTaskId)
+                .eq(AgentTask::getStatus, from.name())
+                .set(AgentTask::getStatus, TaskStatus.CANCELLED.name())
+                .set(AgentTask::getUpdatedAt, now)
+                .set(AgentTask::getFinishedAt, now));
+
+        if (affected == 0) {
+            // 读到写之间被人改了。并发取消 → 幂等返回; 被别人改成别的状态
+            // (比如 Python 恰好报了 COMPLETED) → 拒绝, 让调用方重新读。
+            AgentTask latest = requireTask(agentTaskId);
+            if (TaskStatus.CANCELLED.name().equals(latest.getStatus())) {
+                log.debug("并发取消, 已由另一个请求完成 task={}", agentTaskId);
+                return latest;
+            }
+            throw new CancellationNotAllowedException(agentTaskId,
+                    "并发冲突: 状态在读取之后已被改为 " + latest.getStatus());
+        }
+
+        // 事件 + 闭链 + 审计, 和状态上报同一个事务 —— 不存在"任务已取消
+        // 但执行还显示在跑"的中间态。
+        Map<String, Object> detail = new LinkedHashMap<>();
+        putIfPresent(detail, "reason", trimmedReason);
+        if (attempt != null) {
+            detail.put("attemptNo", attempt.getAttemptNo());
+            putIfPresent(detail, "cancelledTraceId", attempt.getTraceId());
+        }
+        appendEvent(agentTaskId, from, TaskStatus.CANCELLED,
+                TaskEventSource.JAVA_GATEWAY, detail);
+        if (attempt != null) {
+            closeAttempt(attempt, TaskStatus.CANCELLED, now);
+        }
+
+        AgentTask updated = requireTask(agentTaskId);
+
+        // 审计的 trace 用【被取消的那次执行】的, 而不是任务表上可能已经
+        // 指向别处的滚动值。取消属于那次执行的最后一件事, 归到它名下,
+        // 事后按 trace 查"这次执行为什么没跑完"才能查到。
+        String auditTrace = attempt != null ? attempt.getTraceId() : updated.getTraceId();
+        audit.publish(AuditEvent.builder()
+                .taskId(agentTaskId)
+                .traceId(auditTrace)
+                .tenantId(updated.getTenantId())
+                .layer(AuditLayer.TASK_SERVICE)
+                .eventType(AuditEventType.TASK_LIFECYCLE)
+                // 和重试一致: actor 是任务归属用户; "谁发起的"在 source 里
+                // (JAVA_GATEWAY = 人工/调用方显式发起)。
+                .actor(updated.getUserId())
+                .status(AuditEvent.OK)
+                .requestBody(transitionRequest(from, TaskStatus.CANCELLED,
+                        TaskEventSource.JAVA_GATEWAY, detail))
+                .responseBody(taskSnapshot(updated))
+                .build());
+
+        log.info("任务已取消 task={} {} -> CANCELLED trace={} reason={}",
+                agentTaskId, from, auditTrace, trimmedReason == null ? "-" : trimmedReason);
         return updated;
     }
 

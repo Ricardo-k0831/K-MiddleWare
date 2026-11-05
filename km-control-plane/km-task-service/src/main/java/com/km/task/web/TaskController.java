@@ -1,8 +1,11 @@
 package com.km.task.web;
 
+import com.km.task.cancel.TaskCancellationService;
 import com.km.task.domain.AgentTask;
 import com.km.task.domain.AgentTaskEvent;
 import com.km.task.service.TaskService;
+import com.km.task.web.dto.CancelTaskRequest;
+import com.km.task.web.dto.CancelTaskResponse;
 import com.km.task.web.dto.CreateTaskRequest;
 import com.km.task.web.dto.HeartbeatRequest;
 import com.km.task.web.dto.ReportStatusRequest;
@@ -29,6 +32,7 @@ import java.util.List;
  *   GET    /api/tasks/{id}/events      状态流转历史      -> 200 / 404
  *   PATCH  /api/tasks/{id}/status      状态上报          -> 200 / 400 / 404 / 409
  *   POST   /api/tasks/{id}/retry       失败任务重试      -> 200 / 404 / 409
+ *   POST   /api/tasks/{id}/cancel      主动取消任务      -> 200 / 404 / 409
  *   POST   /api/tasks/{id}/heartbeat   执行心跳          -> 204 / 400 / 404 / 409
  * </pre>
  *
@@ -51,11 +55,18 @@ import java.util.List;
 public class TaskController {
 
     private final TaskService taskService;
+    /**
+     * 取消比普通状态变更多一步"通知运行时", 所以走编排服务而不是直接用
+     * {@link TaskService} —— 其他入口仍然只依赖 TaskService。
+     */
+    private final TaskCancellationService cancellationService;
 
-    public TaskController(TaskService taskService) {
+    public TaskController(TaskService taskService, TaskCancellationService cancellationService) {
         this.taskService = taskService;
+        this.cancellationService = cancellationService;
     }
 
+    // 请求路径 /api/tasks. 创建任务
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     // 并且自动生成 trace_id
@@ -68,11 +79,13 @@ public class TaskController {
                 request.maxRetry());
     }
 
+    // 请求路径 /api/tasks/{id}. 查询任务
     @GetMapping("/{agentTaskId}")
     public AgentTask get(@PathVariable String agentTaskId) {
         return taskService.requireTask(agentTaskId);
     }
 
+    // 请求路径 /api/tasks/{id}/events. 查询任务状态流转历史
     @GetMapping("/{agentTaskId}/events")
     public List<AgentTaskEvent> events(@PathVariable String agentTaskId) {
         return taskService.listEvents(agentTaskId);
@@ -113,6 +126,27 @@ public class TaskController {
     public AgentTask retry(@PathVariable String agentTaskId,
                            @Valid @RequestBody(required = false) RetryTaskRequest request) {
         return taskService.retry(agentTaskId, request == null ? null : request.reason());
+    }
+
+    /**
+     * 主动取消任务。
+     *
+     * <p>任何<b>非终态</b>都可以取消 (PENDING 是"派发前反悔", THINKING /
+     * TOOL_CALLING 是"跑到一半停掉")。已经 CANCELLED 的任务<b>幂等</b>返回
+     * 200 —— 取消是故障时最可能被连点的按钮, 让它 409 只会制造第二层混乱。
+     * COMPLETED / FAILED 返回 409 (已经结束, 没有可停的东西)。
+     *
+     * <p>顺序固定: 先落库 (状态 + 事件 + 闭链 + 审计, 一个事务), 再通知
+     * Python 停掉运行并收尾 checkpoint 的挂起。通知失败不会让接口失败,
+     * 结果写在响应的 {@code runtime} 字段里 —— 详见
+     * {@link CancelTaskResponse} 的类注释。
+     *
+     * <p>请求体可省略: {@code {"reason": "..."}} 只是给事件/审计留个理由。
+     */
+    @PostMapping("/{agentTaskId}/cancel")
+    public CancelTaskResponse cancel(@PathVariable String agentTaskId,
+                                     @Valid @RequestBody(required = false) CancelTaskRequest request) {
+        return cancellationService.cancel(agentTaskId, request == null ? null : request.reason());
     }
 
     /**

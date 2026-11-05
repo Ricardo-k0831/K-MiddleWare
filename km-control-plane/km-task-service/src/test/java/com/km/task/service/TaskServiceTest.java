@@ -11,6 +11,7 @@ import com.km.task.domain.AgentTaskAttempt;
 import com.km.task.domain.AgentTaskEvent;
 import com.km.task.domain.TaskEventSource;
 import com.km.task.domain.TaskStatus;
+import com.km.task.error.CancellationNotAllowedException;
 import com.km.task.error.ExecutionMismatchException;
 import com.km.task.error.MaxRetryExceededException;
 import com.km.task.error.RetryNotAllowedException;
@@ -535,6 +536,101 @@ class TaskServiceTest {
         when(attemptMapper.update(isNull(), any())).thenReturn(0);
 
         assertFalse(service.markDispatched(TASK_ID, TRACE_ID));
+    }
+
+    // ------------------------------------------------------------------
+    //  取消
+    // ------------------------------------------------------------------
+
+    @Test
+    void 取消把任务置为CANCELLED并闭掉当前执行() {
+        AgentTask running = task(TaskStatus.THINKING, TRACE_ID);
+        AgentTask cancelled = task(TaskStatus.CANCELLED, TRACE_ID);
+        when(taskMapper.selectById(TASK_ID)).thenReturn(running, cancelled);
+        when(attemptMapper.selectOne(any())).thenReturn(attempt(TASK_ID, TRACE_ID));
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(attemptMapper.update(isNull(), any())).thenReturn(1);
+        when(eventMapper.insert(any(AgentTaskEvent.class))).thenReturn(1);
+
+        AgentTask result = service.cancel(TASK_ID, "用户改主意了");
+
+        assertEquals(TaskStatus.CANCELLED.name(), result.getStatus());
+
+        // ---- 事件: 记成"谁按下的" ----
+        ArgumentCaptor<AgentTaskEvent> eventCaptor =
+                ArgumentCaptor.forClass(AgentTaskEvent.class);
+        verify(eventMapper).insert(eventCaptor.capture());
+        AgentTaskEvent event = eventCaptor.getValue();
+        assertEquals(TaskStatus.THINKING.name(), event.getFromStatus());
+        assertEquals(TaskStatus.CANCELLED.name(), event.getToStatus());
+        assertEquals(TaskEventSource.JAVA_GATEWAY.name(), event.getSource(),
+                "取消是控制面动作, 不能记成 Python 上报");
+        assertEquals("用户改主意了", event.getDetail().get("reason"),
+                "取消理由要进事件 detail");
+
+        // ---- 闭链: 不闭链的话心跳/上报会一直打到一条已死的执行上 ----
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Wrapper<AgentTaskAttempt>> attemptCaptor =
+                ArgumentCaptor.forClass(Wrapper.class);
+        verify(attemptMapper).update(isNull(), attemptCaptor.capture());
+        String sqlSet = attemptCaptor.getValue().getSqlSet().toString();
+        assertTrue(sqlSet.contains("ended_at"), "取消必须给执行闭链: " + sqlSet);
+        assertTrue(sqlSet.contains("status"), "闭链要写终态: " + sqlSet);
+
+        // ---- 审计: 归到【被取消的那次执行】 ----
+        ArgumentCaptor<AuditEvent> auditCaptor = ArgumentCaptor.forClass(AuditEvent.class);
+        verify(audit).publish(auditCaptor.capture());
+        AuditEvent published = auditCaptor.getValue();
+        assertEquals(TRACE_ID, published.traceId(),
+                "取消属于那次执行, 不能挂到任务表上的滚动 trace");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> requestBody = (Map<String, Object>) published.requestBody();
+        assertEquals(TaskStatus.CANCELLED.name(), requestBody.get("to"));
+    }
+
+    @Test
+    void 已结束的任务不能取消() {
+        for (TaskStatus status : new TaskStatus[]{
+                TaskStatus.COMPLETED, TaskStatus.FAILED}) {
+            when(taskMapper.selectById(TASK_ID)).thenReturn(task(status, TRACE_ID));
+
+            assertThrows(CancellationNotAllowedException.class,
+                    () -> service.cancel(TASK_ID, null),
+                    status + " 已经结束, 不该允许取消");
+        }
+        // 拒绝发生在任何写入之前
+        verifyNoInteractions(eventMapper);
+        verify(audit, never()).publish(any());
+    }
+
+    @Test
+    void 重复取消是幂等的() {
+        AgentTask already = task(TaskStatus.CANCELLED, TRACE_ID);
+        when(taskMapper.selectById(TASK_ID)).thenReturn(already);
+
+        AgentTask result = service.cancel(TASK_ID, "又点了一次");
+
+        assertEquals(TaskStatus.CANCELLED.name(), result.getStatus());
+        // 不写第二条事件、不再发审计 —— 否则事件流里会出现两段取消历史
+        verifyNoInteractions(eventMapper);
+        verify(audit, never()).publish(any());
+        verify(taskMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void 没有未闭链执行时仍然可以取消() {
+        // 数据不一致的防御路径: 宁可让任务停在 CANCELLED, 也不能因为
+        // 找不到 attempt 就拒绝一次运维的停止请求。
+        when(taskMapper.selectById(TASK_ID)).thenReturn(
+                task(TaskStatus.PENDING, TRACE_ID), task(TaskStatus.CANCELLED, TRACE_ID));
+        when(attemptMapper.selectOne(any())).thenReturn(null);
+        when(taskMapper.update(isNull(), any())).thenReturn(1);
+        when(eventMapper.insert(any(AgentTaskEvent.class))).thenReturn(1);
+
+        AgentTask result = service.cancel(TASK_ID, null);
+
+        assertEquals(TaskStatus.CANCELLED.name(), result.getStatus());
+        verify(attemptMapper, never()).update(any(), any());
     }
 
     // ------------------------------------------------------------------

@@ -30,6 +30,8 @@ import app.main as main_module
 from app.checkpoint import (
     BACKEND_MEMORY,
     BACKEND_POSTGRES,
+    CANCEL_MESSAGE,
+    MODE_BUSY,
     MODE_FRESH,
     MODE_REPLAY,
     MODE_RESUME,
@@ -38,6 +40,8 @@ from app.checkpoint import (
     memory_resources,
     normalize_backend,
     plan_invocation,
+    release_pending,
+    resolve_thread_id,
 )
 from app.config import Settings
 
@@ -121,6 +125,36 @@ def test_Windows的Proactor循环给出可执行的报错():
 
 
 # ----------------------------------------------------------------------
+#  线程身份: 会话是记忆单位, 任务是执行身份
+# ----------------------------------------------------------------------
+
+
+def test_会话优先于任务并且带租户前缀():
+    """同一个会话里的多个任务必须落在同一个 thread 上 —— 这是会话记忆的全部。"""
+    assert resolve_thread_id(
+        session_id="s-1", tenant_id="km", task_id="task-1", thread_id="x"
+    ) == "session:km:s-1"
+
+
+def test_没有会话时任务自己成线程():
+    assert resolve_thread_id(task_id="task-1", thread_id="x") == "task:task-1"
+
+
+def test_两个身份都没有时用调用方线程():
+    assert resolve_thread_id(thread_id="chat-1") == "chat-1"
+    assert resolve_thread_id() == "default"
+    # 空串按"没给"处理, 不能变成空 thread_id
+    assert resolve_thread_id(session_id="  ", task_id=" ", thread_id="") == "default"
+
+
+def test_不同租户的同名会话不会共享记忆():
+    """session_id 是调用方自己起的名字, 只在租户内唯一 —— key 必须带租户。"""
+    a = resolve_thread_id(session_id="same", tenant_id="tenant-a")
+    b = resolve_thread_id(session_id="same", tenant_id="tenant-b")
+    assert a != b
+
+
+# ----------------------------------------------------------------------
 #  真图的崩溃 / 恢复语义
 # ----------------------------------------------------------------------
 
@@ -150,8 +184,12 @@ def _build_graph(*, fail_first: bool = False):
     return graph.compile(checkpointer=InMemorySaver()), calls
 
 
-def _config(thread_id: str) -> dict:
-    return {"configurable": {"thread_id": thread_id}}
+def _config(thread_id: str, task_id: str | None = None) -> dict:
+    """构造 config; task_id 会作为 metadata 落进 checkpoint —— 任务归属靠它。"""
+    config: dict = {"configurable": {"thread_id": thread_id}}
+    if task_id is not None:
+        config["metadata"] = {"task_id": task_id}
+    return config
 
 
 def test_节点崩溃后留下挂起状态并可续跑():
@@ -164,13 +202,13 @@ def test_节点崩溃后留下挂起状态并可续跑():
 
     async def _go() -> None:
         graph, calls = _build_graph(fail_first=True)
-        config = _config("crash-1")
+        config = _config("crash-1", task_id="task-1")
         with pytest.raises(RuntimeError):
             await graph.ainvoke(
                 {"messages": [{"role": "user", "content": "查订单"}]}, config
             )
 
-        plan = await plan_invocation(graph, config, "查订单", task_scoped=True)
+        plan = await plan_invocation(graph, config, "查订单", task_id="task-1")
         assert plan.mode == MODE_RESUME
         assert plan.payload is None, "续跑必须用空输入, 否则同一个问题会问两遍"
         assert plan.pending_nodes, "崩溃后应当有未执行的节点"
@@ -189,12 +227,12 @@ def test_已完成的任务链路只复述结果不再执行():
 
     async def _go() -> None:
         graph, calls = _build_graph()
-        config = _config("done-1")
+        config = _config("done-1", task_id="task-1")
         first = await graph.ainvoke(
             {"messages": [{"role": "user", "content": "查订单"}]}, config
         )
 
-        plan = await plan_invocation(graph, config, "查订单", task_scoped=True)
+        plan = await plan_invocation(graph, config, "查订单", task_id="task-1")
         assert plan.mode == MODE_REPLAY
         assert plan.payload is None
         assert plan.baseline_messages == len(first["messages"])
@@ -218,7 +256,7 @@ def test_自由对话的新问题不会被挂起状态吞掉():
                 {"messages": [{"role": "user", "content": "旧问题"}]}, config
             )
 
-        plan = await plan_invocation(graph, config, "新问题", task_scoped=False)
+        plan = await plan_invocation(graph, config, "新问题")
         assert plan.mode == MODE_FRESH
         assert plan.payload == {"messages": [{"role": "user", "content": "新问题"}]}
 
@@ -239,7 +277,7 @@ def test_自由对话重发同一句话才续跑():
                 {"messages": [{"role": "user", "content": "同一个问题"}]}, config
             )
 
-        plan = await plan_invocation(graph, config, "同一个问题", task_scoped=False)
+        plan = await plan_invocation(graph, config, "同一个问题")
         assert plan.mode == MODE_RESUME
         assert plan.payload is None
 
@@ -254,9 +292,53 @@ def test_自由对话已完成的历史不触发复述():
         config = _config("free-3")
         await graph.ainvoke({"messages": [{"role": "user", "content": "你好"}]}, config)
 
-        plan = await plan_invocation(graph, config, "查订单", task_scoped=False)
+        plan = await plan_invocation(graph, config, "查订单")
         assert plan.mode == MODE_FRESH
         assert plan.baseline_messages == 2
+
+    asyncio.run(_go())
+
+
+def test_同一会话的两个任务共享历史但不共享答案():
+    """会话记忆的实际效果, 用真图跑一遍:
+
+    任务 B 必须看到任务 A 的问答 (上下文连续), 但如果 A 已经答完, B 不能
+    拿 A 的答案当自己的结果 —— 那是复述, 不是执行。
+    """
+
+    async def _go() -> None:
+        graph, _ = _build_graph()
+        config = _config("session-1", task_id="task-a")
+        await graph.ainvoke(
+            {"messages": [{"role": "user", "content": "任务A"}]}, config
+        )
+
+        plan = await plan_invocation(graph, config, "任务B", task_id="task-b")
+        assert plan.mode == MODE_FRESH
+        assert plan.baseline_messages == 2, "B 应当看到 A 的两条消息"
+
+        result = await graph.ainvoke(plan.payload, config)
+        contents = [m.content for m in result["messages"]]
+        assert contents == ["任务A", "答案", "任务B", "答案"]
+
+    asyncio.run(_go())
+
+
+def test_会话里别的任务崩了会拒绝而不是接管():
+    """真图 + 真 metadata: BUSY 的判据在真实快照上同样成立。"""
+
+    async def _go() -> None:
+        graph, _ = _build_graph(fail_first=True)
+        config = _config("session-2", task_id="task-a")
+        with pytest.raises(RuntimeError):
+            await graph.ainvoke(
+                {"messages": [{"role": "user", "content": "任务A"}]}, config
+            )
+
+        plan = await plan_invocation(graph, config, "任务B", task_id="task-b")
+        assert plan.mode == MODE_BUSY
+        assert plan.busy_task_id == "task-a"
+        assert plan.pending_nodes, "拒绝的理由应当能报出来"
 
     asyncio.run(_go())
 
@@ -267,9 +349,16 @@ def test_自由对话已完成的历史不触发复述():
 
 
 class _Snapshot:
-    def __init__(self, messages: list | None = None, next_nodes: tuple = ()) -> None:
+    def __init__(
+        self,
+        messages: list | None = None,
+        next_nodes: tuple = (),
+        task_id: str | None = None,
+    ) -> None:
         self.values = {"messages": list(messages or [])}
         self.next = next_nodes
+        # 任务归属: 真实 StateSnapshot.metadata 里由 config["metadata"] 带进来
+        self.metadata = {"task_id": task_id} if task_id is not None else {}
 
 
 class _Agent:
@@ -283,15 +372,15 @@ class _Agent:
         return self.snapshot
 
 
-def _plan(agent, message: str, *, task_scoped: bool):
+def _plan(agent, message: str, *, task_id: str | None = None):
     return asyncio.run(
         plan_invocation(agent, {"configurable": {"thread_id": "t"}}, message,
-                        task_scoped=task_scoped)
+                        task_id=task_id)
     )
 
 
 def test_空thread按新对话处理():
-    plan = _plan(_Agent(), "查订单", task_scoped=True)
+    plan = _plan(_Agent(), "查订单", task_id="task-1")
     assert plan.mode == MODE_FRESH
     assert plan.baseline_messages == 0
 
@@ -305,30 +394,100 @@ def test_图没有aget_state时按新对话处理():
 
     plan = asyncio.run(
         plan_invocation(Bare(), {"configurable": {"thread_id": "t"}}, "hi",
-                        task_scoped=True)
+                        task_id="task-1")
     )
     assert plan.mode == MODE_FRESH
 
 
 def test_读快照失败时按新对话处理():
-    plan = _plan(_Agent(error=RuntimeError("postgres 抖了")), "查订单", task_scoped=True)
+    plan = _plan(_Agent(error=RuntimeError("postgres 抖了")), "查订单", task_id="task-1")
     assert plan.mode == MODE_FRESH
 
 
 def test_任务链路最后一条是用户消息时不复述():
     """理论上不该出现 (ReAct 结束一定以 AI 消息收尾), 但真出现时不能把
     用户的问题当成答案返回 —— 那比重新执行一次糟得多。"""
-    snapshot = _Snapshot(messages=[HumanMessage(content="查订单")])
-    plan = _plan(_Agent(snapshot), "查订单", task_scoped=True)
+    snapshot = _Snapshot(messages=[HumanMessage(content="查订单")], task_id="task-1")
+    plan = _plan(_Agent(snapshot), "查订单", task_id="task-1")
     assert plan.mode == MODE_FRESH
 
 
 def test_即使消息内容相同任务链路也不重复追加():
-    """重试的 message 永远是 task.intent; 只要 thread 里有历史就必须续上。"""
-    snapshot = _Snapshot(messages=[HumanMessage(content="查订单")], next_nodes=("agent",))
-    plan = _plan(_Agent(snapshot), "查订单", task_scoped=True)
+    """重试的 message 永远是 task.intent; 只要同一个任务挂起就必须续上。"""
+    snapshot = _Snapshot(
+        messages=[HumanMessage(content="查订单")], next_nodes=("agent",), task_id="task-1"
+    )
+    plan = _plan(_Agent(snapshot), "查订单", task_id="task-1")
     assert plan.mode == MODE_RESUME
     assert plan.payload is None
+
+
+# ----------------------------------------------------------------------
+#  会话线程里的任务归属 —— 这套设计的核心不变量
+# ----------------------------------------------------------------------
+
+
+def test_别的任务的挂起不续跑():
+    """★ 会话记忆的前提是"能共享", 但共享不等于"能接管别人的执行" ★"""
+    snapshot = _Snapshot(
+        messages=[HumanMessage(content="任务A的问题")],
+        next_nodes=("agent",),
+        task_id="task-a",
+    )
+    plan = _plan(_Agent(snapshot), "任务B的问题", task_id="task-b")
+
+    assert plan.mode == MODE_BUSY
+    assert plan.payload is None, "BUSY 绝不能带着输入去碰别人的挂起状态"
+    assert plan.busy_task_id == "task-a"
+
+
+def test_没有归属的挂起对任务也是占用():
+    """自由对话崩在半路时, 任务不能把它的挂起节点当成自己的断点。"""
+    snapshot = _Snapshot(
+        messages=[HumanMessage(content="随便聊聊")],
+        next_nodes=("agent",),
+    )
+    plan = _plan(_Agent(snapshot), "查订单", task_id="task-1")
+    assert plan.mode == MODE_BUSY
+    assert plan.busy_task_id is None
+
+
+def test_别的任务留下的完成状态不能复述():
+    """★ 会话线程下最容易犯的错 ★
+
+    会话里最后一条是 AI 消息, 但那可能是上一个任务的答案。把它复述给新任务
+    等于答非所问, 还省掉了一次本该发生的执行。
+    """
+    snapshot = _Snapshot(
+        messages=[HumanMessage(content="任务A"), AIMessage(content="任务A的答案")],
+        task_id="task-a",
+    )
+    plan = _plan(_Agent(snapshot), "任务B", task_id="task-b")
+
+    assert plan.mode == MODE_FRESH
+    assert plan.baseline_messages == 2, "新任务要在完整会话历史上追加"
+
+
+def test_自由对话不碰任务留下的挂起():
+    """同一个会话里, 用户的手动提问不能把正在跑的任务接走。"""
+    snapshot = _Snapshot(
+        messages=[HumanMessage(content="任务A")],
+        next_nodes=("agent",),
+        task_id="task-a",
+    )
+    plan = _plan(_Agent(snapshot), "顺便问一句", task_id=None)
+    assert plan.mode == MODE_BUSY
+    assert plan.busy_task_id == "task-a"
+
+
+def test_自由对话在任务已完成的会话里照常追加():
+    snapshot = _Snapshot(
+        messages=[HumanMessage(content="任务A"), AIMessage(content="任务A的答案")],
+        task_id="task-a",
+    )
+    plan = _plan(_Agent(snapshot), "顺便问一句", task_id=None)
+    assert plan.mode == MODE_FRESH
+    assert plan.baseline_messages == 2
 
 
 # ----------------------------------------------------------------------
@@ -435,5 +594,107 @@ def test_health把记忆降级标成degraded():
         assert body["status"] == "degraded"
         assert body["checkpoint_backend"] == BACKEND_MEMORY
         assert "连不上" in body["checkpoint_degraded"]
+
+    asyncio.run(_go())
+
+
+# ----------------------------------------------------------------------
+#  取消: 把挂起状态收尾, 让会话线程重新可用
+# ----------------------------------------------------------------------
+
+
+def _build_release_graph(*, fail_first: bool = True):
+    """节点名必须是 ``agent`` —— 和 create_react_agent 的图一致。
+
+    ``release_pending`` 用 ``as_node="agent"`` 写入终止消息; 换名字就
+    写不进去。这里刻意用真图而不是假快照: "写完之后 next 真的空了"
+    是 LangGraph 用条件边重新计算的结果, 假对象证明不了。
+    """
+    calls = {"n": 0}
+
+    def agent_node(state: _State) -> dict:
+        calls["n"] += 1
+        if fail_first and calls["n"] == 1:
+            raise RuntimeError("模拟节点崩溃")
+        return {"messages": [AIMessage(content="答案")]}
+
+    graph = StateGraph(_State)
+    graph.add_node("agent", agent_node)
+    graph.add_edge(START, "agent")
+    graph.add_edge("agent", END)
+    return graph.compile(checkpointer=InMemorySaver()), calls
+
+
+def test_取消后挂起被收尾并且会话可以被下一个任务使用():
+    """★ 取消不只是"不再跑", 还要把占着线程的挂起清掉 ★
+
+    不做这一步, ``plan_invocation`` 会一直看到 pending, 同会话的下一个
+    任务永远 409 —— 而那个挂起的任务已经 CANCELLED, 永远不会有人来续跑。
+    """
+
+    async def _go() -> None:
+        graph, calls = _build_release_graph()
+        config = _config("cancel-1", task_id="task-a")
+        with pytest.raises(RuntimeError):
+            await graph.ainvoke(
+                {"messages": [{"role": "user", "content": "查订单"}]}, config
+            )
+
+        before = await graph.aget_state(config)
+        assert before.next, "崩溃后应当有挂起节点"
+
+        released = await release_pending(graph, config, task_id="task-a")
+        assert released is True
+
+        after = await graph.aget_state(config)
+        assert tuple(after.next) == (), f"取消后仍有挂起: {after.next}"
+        contents = [m.content for m in after.values["messages"]]
+        assert contents[0] == "查订单"
+        assert contents[-1] == CANCEL_MESSAGE, "收尾消息应当写进会话历史"
+        assert calls["n"] == 1, "收尾不能重新执行节点"
+
+        # 会话解锁: 另一个任务进来应当开新一轮, 而不是 BUSY。
+        plan = await plan_invocation(graph, config, "另一个问题", task_id="task-b")
+        assert plan.mode == MODE_FRESH, f"会话仍被占用: {plan.mode}"
+
+    asyncio.run(_go())
+
+
+def test_没有挂起时取消是幂等的():
+    """跑到一半之前就收到取消 (任务还在 PENDING) 不该报错或改历史。"""
+
+    async def _go() -> None:
+        graph, _ = _build_release_graph()
+        config = _config("cancel-2", task_id="task-a")
+
+        assert await release_pending(graph, config, task_id="task-a") is False
+
+        # 再取消一次也一样: 没有挂起就是没有事要做。
+        assert await release_pending(graph, config, task_id="task-a") is False
+
+    asyncio.run(_go())
+
+
+def test_取消不碰别的任务留下的挂起():
+    """★ 归属校验: 只有自己任务的挂起才能收尾 ★
+
+    会话线程里可能挂着另一个任务 (它还在跑)。取消 A 时把 B 的挂起写死,
+    等于替 B 结束了一次执行 —— 而 B 的 Java 状态还是 THINKING。
+    """
+
+    async def _go() -> None:
+        graph, _ = _build_release_graph()
+        config = _config("cancel-3", task_id="task-a")
+        with pytest.raises(RuntimeError):
+            await graph.ainvoke(
+                {"messages": [{"role": "user", "content": "A 的问题"}]}, config
+            )
+
+        assert await release_pending(graph, config, task_id="task-b") is False
+
+        after = await graph.aget_state(config)
+        assert after.next, "别的任务的挂起必须原样保留"
+        contents = [m.content for m in after.values["messages"]]
+        assert CANCEL_MESSAGE not in contents
 
     asyncio.run(_go())

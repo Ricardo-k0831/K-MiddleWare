@@ -4,6 +4,7 @@ import com.km.task.domain.AgentTask;
 import com.km.task.domain.TaskEventSource;
 import com.km.task.domain.TaskStatus;
 import com.km.task.service.TaskService;
+import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpMethod;
@@ -12,11 +13,20 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.ConnectException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -62,8 +72,11 @@ class RetryDispatcherTest {
                 .andExpect(jsonPath("$.task_id").value("task-1"))
                 // 用新链的 trace, 不是上一轮失败的 trace
                 .andExpect(jsonPath("$.trace_id").value("trace-new"))
-                // thread_id 跟 task_id 走: 一次执行一个独立会话, 不继承上一遍上下文
+                // thread_id 仍给 task_id —— Python 只在 session_id 缺失时才用它
                 .andExpect(jsonPath("$.thread_id").value("task-1"))
+                // session_id 才是会话线程的输入: 重试落回同一个会话线程,
+                // 既保住会话记忆, 又靠 metadata.task_id 只续自己那一遍
+                .andExpect(jsonPath("$.session_id").value("session-1"))
                 .andExpect(jsonPath("$.tenant_id").value("km"))
                 .andExpect(jsonPath("$.actor").value("U1001"))
                 .andRespond(withSuccess("{}", MediaType.APPLICATION_JSON));
@@ -133,12 +146,63 @@ class RetryDispatcherTest {
         assertFalse(RetryDispatcher.neverReachedPython(new IllegalStateException("boom")));
     }
 
+    /**
+     * 真实客户端必须是 HTTP/1.1。
+     *
+     * <p>E2E 实测 (2026-11-04): 自动重试派发到 Python 全部 422 (FastAPI 说
+     * "body 缺失"), 而同一时刻 curl 直连正常。uvicorn 日志是
+     * {@code Unsupported upgrade request} + {@code Invalid HTTP request received}:
+     * JDK HttpClient 默认 HTTP_2, 对明文 http:// 会先发 h2c 升级, uvicorn 不
+     * 支持这种升级并丢掉请求体。所以这里用裸 socket 抓请求头, 只断言一件事:
+     * <b>不许出现 Upgrade</b>。这跟服务端用什么实现无关, 是客户端侧的约束。
+     */
+    @Test
+    void 真实客户端不发h2c升级() throws Exception {
+        try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            AtomicReference<String> head = new AtomicReference<>();
+            Thread probe = new Thread(() -> {
+                try (Socket socket = server.accept()) {
+                    InputStream in = socket.getInputStream();
+                    ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                    int b;
+                    while ((b = in.read()) != -1) {
+                        buf.write(b);
+                        // 只需要请求头。请求体可能是 chunked, 读到这里就够了。
+                        if (buf.toString(StandardCharsets.ISO_8859_1).endsWith("\r\n\r\n")) {
+                            break;
+                        }
+                    }
+                    head.set(buf.toString(StandardCharsets.ISO_8859_1));
+                    socket.getOutputStream().write(
+                            ("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                    .getBytes(StandardCharsets.ISO_8859_1));
+                    socket.getOutputStream().flush();
+                } catch (IOException ignored) {
+                    // 客户端提前关连接不影响断言 —— 我们要的是它发出去的请求头。
+                }
+            }, "h2c-probe");
+            probe.setDaemon(true);
+            probe.start();
+
+            RetryProperties.Dispatch config = new RetryProperties.Dispatch();
+            config.setChatUrl("http://127.0.0.1:" + server.getLocalPort());
+            new RetryDispatcher(RetryDispatcher.buildClient(RestClient.builder(), config),
+                    taskService, Runnable::run).dispatch(task());
+
+            probe.join(5_000);
+            assertNotNull(head.get(), "客户端没有发出请求");
+            assertFalse(head.get().toLowerCase().contains("upgrade"),
+                    "不能发 h2c 升级: uvicorn 会丢掉请求体\n" + head.get());
+        }
+    }
+
     private static AgentTask task() {
         AgentTask task = new AgentTask();
         task.setAgentTaskId("task-1");
         task.setTraceId("trace-new");
         task.setStatus(TaskStatus.PENDING.name());
         task.setIntent("查一下订单 SO1");
+        task.setSessionId("session-1");
         task.setTenantId("km");
         task.setUserId("U1001");
         return task;

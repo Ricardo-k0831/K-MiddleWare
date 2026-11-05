@@ -26,11 +26,14 @@ from pydantic import BaseModel, Field
 from app.audit import AuditCallbackHandler, AuditReporter
 from app.checkpoint import (
     BACKEND_POSTGRES,
+    MODE_BUSY,
     MODE_FRESH,
     CheckpointResources,
     build_checkpointer,
     memory_resources,
     plan_invocation,
+    release_pending,
+    resolve_thread_id,
 )
 from app.config import get_settings
 from app.graph.agent import build_agent
@@ -96,6 +99,81 @@ state = AppState()
 # 通过 HTTP 绕一圈。见 tests/test_heartbeat.py。
 LIVENESS = LivenessRegistry()
 
+# 每个会话线程一把进程内锁, 让同一会话里的多个任务串行写 checkpoint。
+#
+# 为什么必须有: LangGraph 的 thread 不是为并发写设计的 —— 两个任务同时
+# 从同一个快照出发, 会各自写出一条分支, 最终状态只留下一条, 另一条任务
+# 的对话 (甚至它的 COMPLETED 上报) 就像没发生过。
+#
+# 为什么是"进程内": 本项目是单实例部署 (心跳/探活也是同一前提, 见
+# app/heartbeat.py)。多实例时必须换成分布式锁 (Postgres advisory lock)
+# 或按 session_id 做路由, 否则两个实例之间仍然会互踩。
+#
+# 为什么不用完就删: 条目数 = 进程见到的会话数, 一个 lock 只有几十字节;
+# 删除反而会引入"删的瞬间另一个协程拿到旧锁"的竞态。要清理得配空闲计数。
+_THREAD_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _thread_lock(thread_id: str) -> asyncio.Lock:
+    lock = _THREAD_LOCKS.get(thread_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _THREAD_LOCKS[thread_id] = lock
+    return lock
+
+
+# 正在执行的任务 → 承载 ainvoke 的 asyncio.Task。取消接口靠它找到"要停哪一个"。
+#
+# 为什么需要这张表: Java 的取消接口是另一个 HTTP 请求, 它和正在跑的 /chat
+# 之间没有任何调用关系 —— 不登记的话, 取消只能改 Java 侧状态, 而图的
+# LLM 调用、工具调用还会继续跑完 (花钱、改数据), 用户看到的"取消"名不副实。
+#
+# 只登记带 task_id 的运行。自由对话没有可取消的身份, 也不该被任何外部
+# 请求打断。
+#
+# 为什么 key 用 task_id 而不是 thread_id: 一个会话线程同时只允许一个任务
+# (见 _thread_lock 与 plan_invocation 的 BUSY), 所以 task_id 在这里天然唯一;
+# 而取消的调用方 (Java) 手上只有 task_id。
+#
+# 单实例前提, 和 _THREAD_LOCKS 一样: 多实例取消要广播到持有该运行的实例。
+_RUNNING: dict[str, asyncio.Task[Any]] = {}
+
+
+async def _run_agent(
+    agent: Any,
+    payload: Any,
+    *,
+    config: dict[str, Any],
+    task_id: str | None,
+) -> Any:
+    """执行一次图调用, 并让带 task_id 的运行可以被取消。
+
+    直接 ``await agent.ainvoke(...)`` 也能跑, 但那样没有句柄可取消 ——
+    asyncio.Task 是唯一能从【另一个请求】里停下这段执行的入口。
+
+    包装成 Task 不改变语义: 当前协程仍然原地等它, 异常照常抛出,
+    contextvars (任务身份) 会被 create_task 复制进新任务, 工具调用
+    依旧知道自己在替哪个任务干活。
+
+    登记/注销必须成对且用 ``is`` 比对: 同一个 task_id 理论上只会有一个
+    运行 (会话锁保证), 但真出现第二个时, 先结束的那个不能把后来者的
+    句柄从表里删掉 —— 否则取消会打到一个已经结束的任务上。
+    """
+    run: asyncio.Task[Any] = asyncio.create_task(
+        agent.ainvoke(payload, config=config),
+        name=f"agent-run-{task_id or 'chat'}",
+    )
+    if task_id is not None:
+        previous = _RUNNING.get(task_id)
+        if previous is not None and not previous.done():
+            logger.warning("同一个任务已有运行在跑, 登记被覆盖 task=%s", task_id)
+        _RUNNING[task_id] = run
+    try:
+        return await run
+    finally:
+        if task_id is not None and _RUNNING.get(task_id) is run:
+            _RUNNING.pop(task_id, None)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -146,8 +224,8 @@ async def lifespan(app: FastAPI):
             # 串上下文的风险从"重启即消失"变成"永久存在"。这里先提醒,
             # 真正的隔离 (按 tenant/user 命名空间化) 等有会话级调用方时再做。
             logger.warning(
-                "checkpoint=postgres: 不带 task_id 的 /chat 会共用 thread_id='default', "
-                "多客户端部署时应显式传 thread_id"
+                "checkpoint=postgres: 既没有 session_id 也没有 task_id 的 /chat 会共用 "
+                "thread_id='default', 多客户端部署时应显式传 session_id (或 thread_id)"
             )
 
     yield
@@ -176,14 +254,26 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="用户输入")
     thread_id: str = Field(
         default="default",
-        description="会话ID。同一个 thread_id 的多轮对话共享上下文",
+        description=(
+            "自由对话的线程ID。只有 session_id 和 task_id 都没给时才用它; "
+            "同一个 thread_id 的多轮对话共享上下文。"
+        ),
+    )
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "会话ID, 来自任务创建响应 (agent_task.session_id)。★ 会话语义的"
+            "第一优先级 ★ 给了它, 对话记忆就按 [租户+会话] 累积 —— 同一会话"
+            "里的多个任务共享上下文。任务不再占用 thread, 只在 checkpoint 的 "
+            "metadata 里标记归属。"
+        ),
     )
     task_id: str | None = Field(
         default=None,
         description=(
-            "Java 侧建好的任务ID。给了就启用任务链路: 它同时作为 thread_id, "
-            "运行期间状态实时回调 Java, 终态也由这里上报。"
-            "不给则行为与 Phase1 完全一致。"
+            "Java 侧建好的任务ID。给了就启用任务链路: 运行期间状态实时回调 "
+            "Java, 终态也由这里上报。没有 session_id 时它自己就是 thread_id "
+            "(记忆按任务隔离)。"
         ),
     )
     # ---- 下面三个是【任务身份】, 只在带了 task_id 时有意义 ----
@@ -234,6 +324,25 @@ class ChatResponse(BaseModel):
     # 同上的理由: 回显它, 验收脚本才能拿它去 audit_log 里对账
     # ("我发出去的身份"和"数据库收到的身份"是不是同一个)。
     trace_id: str | None = None
+
+
+class CancelRequest(BaseModel):
+    """控制面发来的取消请求 —— 只用来【定位】那次运行, 不用来判定该不该取消。
+
+    该不该取消是 Java 状态机的决定 (它已经把任务改成 CANCELLED 才发这个
+    请求)。Python 这一侧只回答"停没停掉、挂起清没清掉", 不再做第二套
+    业务判断 —— 两个事实源是这类系统最典型的坑。
+
+    session_id / tenant_id 是定位线程的输入: 线程身份由
+    ``resolve_thread_id`` 从这两者算出来, 少了 session_id 就会算成任务
+    线程, 而那次运行其实可能在会话线程上 —— 收尾会打空。
+    """
+
+    session_id: str | None = None
+    tenant_id: str | None = None
+    trace_id: str | None = None
+    # 仅用于日志: 让"为什么取消"能和 Java 的事件/审计对上话。
+    reason: str | None = None
 
 
 # ============================================================
@@ -478,6 +587,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # 会得到一个必定 404 的 task_id, 只会在日志里刷一片无用的警告。
     task_id = (req.task_id or "").strip() or None
     trace_id = (req.trace_id or "").strip() or None
+    session_id = (req.session_id or "").strip() or None
+    tenant_id = (req.tenant_id or "").strip() or None
 
     reporter: TaskStateReporter | None = None
     audit: AuditReporter | None = None
@@ -518,7 +629,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
             identity = TaskIdentity(
                 task_id=task_id,
                 trace_id=trace_id,
-                tenant_id=(req.tenant_id or "").strip() or None,
+                tenant_id=tenant_id,
                 actor=(req.actor or "").strip() or None,
             )
 
@@ -573,25 +684,47 @@ async def chat(req: ChatRequest) -> ChatResponse:
             )
             await beater.start()
 
-        # 任务链路下 task_id 同时就是 LangGraph 的 thread_id —— 两者本来就是
-        # 同一个东西 ("这单业务"和"这张图跑到哪了"), 共用一个 ID 让断点续跑
-        # 不需要任何映射表。见 AgentTask 的类注释。
+        # ---- 线程身份: 会话是记忆的单位, 任务是执行身份 ----
         #
-        # ★ 代价: 对话记忆是按【任务】隔离的, 不是按【会话】★
-        # 同一个 session 里连问两件事 = 两个 task = 两个 thread, 第二个任务
-        # 看不见第一个任务的上下文。现在的"会话"只有 agent_task.session_id
-        # 这个数据库标签, 运行时并不认识它。
-        # 要做到会话级记忆, thread_id 应当是 session_id, 用 LangGraph 的
-        # checkpoint_ns 区分任务 —— 那是 Phase 2 的事。这里写清楚, 是为了
-        # 避免误以为"同一会话的多个任务共享记忆"而按这个前提去设计功能。
+        # ★ 最终方案 (2026-11-04) ★
+        #   session_id 有值 → thread_id = "session:<tenant>:<session_id>"
+        #   否则 task_id  → thread_id = "task:<task_id>"
+        #   都没有        → 用调用方给的 thread_id (缺省 default)
+        # 判据和租户前缀的理由都写在 app/checkpoint.py 的 resolve_thread_id 里。
         #
-        # 但"按任务隔离"恰好是断点续跑要的: 重试换的是 trace, task_id 不变,
-        # 所以同一个任务的第 N 次执行天然落在同一个 thread 上 —— 不需要任何
-        # 映射表, 也不需要把上一次的执行位置存进 agent_task.checkpoint_ref。
-        thread_id = task_id or req.thread_id
+        # ★ 为什么不是"thread_id = session_id, 用 checkpoint_ns 区分任务"? ★
+        # 实测过了: checkpoint_ns 是【子图】的命名空间。对根图传一个自造的 ns,
+        # aget_state 直接 ValueError("Subgraph ... not found"); 而且不同 ns 的
+        # messages 本来就互相隔离 —— 会话记忆要的恰恰是共享。两者不可兼得。
+        #
+        # 所以任务不再占 thread, 而是以 metadata.task_id 的形式标在 checkpoint 上。
+        # plan_invocation 靠它区分"同一个任务的第 N 次执行"和"同一会话里的另一个
+        # 任务": 前者可续跑/复述, 后者必须开新轮, 绝不能续别人的半截推理。
+        #
+        # ★ 重试仍然不需要映射表 ★ 重试换 trace, 但 task_id 与 session_id 都不变,
+        # 算出来的 thread 一样; 归属信息随 checkpoint 走, 也不需要把执行位置
+        # 存进 agent_task.checkpoint_ref。
+        #
+        # ★ 代价: 同一会话里的任务必须串行 ★ 两个任务同时写一个 thread 会互踩
+        # 分支。进程内用 _thread_lock 串起来; 多实例部署需要分布式锁或按会话
+        # 分片, 已记在 docs/task-state-machine.md。
+        thread_id = resolve_thread_id(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            task_id=task_id,
+            thread_id=req.thread_id,
+        )
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
         if callbacks:
             config["callbacks"] = callbacks
+        # 归属信息只在任务链路下有。自由对话不写 —— plan_invocation 正是靠
+        # "没有 task_id" 来区分"上一次自由对话崩了"和"某个任务留下的挂起"。
+        if task_id is not None:
+            config["metadata"] = {
+                "task_id": task_id,
+                "trace_id": trace_id,
+                "session_id": session_id,
+            }
 
         try:
             # ★ 身份的作用域要【恰好】包住这次 invocation ★
@@ -606,25 +739,46 @@ async def chat(req: ChatRequest) -> ChatResponse:
             # Agent 内部对工具调用的调度 (LangGraph 的 ReAct 循环、它起的
             # 子任务) 都在这个块里, ContextVar 会自动传播进去, 不需要把身份
             # 当参数一层层往下传。
-            with task_identity(identity):
-                # 先问 checkpoint 这个 thread 停没停在半路, 再决定喂什么输入。
-                # 三种处置 (续跑 / 复述结果 / 开新一轮) 的判据和理由都写在
-                # app/checkpoint.py 的 plan_invocation 里。
-                plan = await plan_invocat
-                ion(
-                    state.agent,
-                    config,
-                    req.message,
-                    task_scoped=task_id is not None,
-                )
-                if plan.mode != MODE_FRESH:
-                    logger.info(
-                        "thread=%s 命中 checkpoint, 按 %s 处置 (pending=%s)",
-                        thread_id,
-                        plan.mode,
-                        plan.pending_nodes or "-",
+            #
+            # 锁包住"读快照 → 决定 → 调用"整段: 只锁 ainvoke 的话, 两个并发
+            # 请求会同时读到同一个旧快照, 各自追加消息, 后写的把先写的顶掉。
+            async with _thread_lock(thread_id):
+                with task_identity(identity):
+                    # 先问 checkpoint 这个 thread 停没停在半路、是谁留下的,
+                    # 再决定喂什么输入。四种处置的判据和理由都写在
+                    # app/checkpoint.py 的 plan_invocation 里。
+                    plan = await plan_invocation(
+                        state.agent,
+                        config,
+                        req.message,
+                        task_id=task_id,
                     )
-                result = await state.agent.ainvoke(plan.payload, config=config)
+                    if plan.mode == MODE_BUSY:
+                        # 409 而不是 500: 报文和身份都没问题, 是会话线程的当前
+                        # 状态不允许。调用方要么等那个任务结束/被心跳兜底关掉,
+                        # 要么换一个 session_id。
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"会话线程被占用: thread={thread_id} 上还有任务 "
+                                f"{plan.busy_task_id or '(未知)'} 未完成 "
+                                f"(pending={plan.pending_nodes})。"
+                                "请等它结束或重试完成后再发; 不要并发写同一个会话。"
+                            ),
+                        )
+                    if plan.mode != MODE_FRESH:
+                        logger.info(
+                            "thread=%s 命中 checkpoint, 按 %s 处置 (pending=%s)",
+                            thread_id,
+                            plan.mode,
+                            plan.pending_nodes or "-",
+                        )
+                    result = await _run_agent(
+                        state.agent,
+                        plan.payload,
+                        config=config,
+                        task_id=task_id,
+                    )
 
             # ReAct 循环产出的最后一条消息就是最终答复。
             # 注意 replay 时图一个节点都不跑, 返回的是上次的最终状态 ——
@@ -657,6 +811,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
             if reporter is not None:
                 reporter.report(COMPLETED, {"result": reply})
 
+        except HTTPException:
+            # 409 "会话被占用" 是在 try 里主动抛的 —— 它不是 Agent 执行失败,
+            # 不能套上 500 的外衣, 也不能报一条 FAILED (那个任务根本没跑)。
+            raise
         except Exception as ex:
             logger.exception("Agent 执行失败")
             if reporter is not None:
@@ -692,3 +850,117 @@ async def chat(req: ChatRequest) -> ChatResponse:
         task_id=task_id,
         trace_id=identity.trace_id if identity is not None else None,
     )
+
+
+# ============================================================
+#  取消 —— 控制面的"停下", 运行时只负责执行
+# ============================================================
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str, req: CancelRequest | None = None) -> dict[str, Any]:
+    """停止一个任务的运行, 并把它留在会话线程上的挂起状态收尾。
+
+    ★ 谁决定"该不该取消" ★
+
+    Java 状态机。它先把任务改成 CANCELLED (闭链 + 事件 + 审计), 然后才
+    调这个接口。这里如果再做一次业务判断, 就会出现两个事实源 —— 比如
+    Python 认为"还能取消"而 Java 已经拒绝, 或者反过来。所以本接口只做
+    两件机械动作:
+
+    1. **停**: 如果这个任务正有一个 ainvoke 在这里跑, cancel 它;
+    2. **收尾**: 如果 checkpoint 上还挂着 ``next``, 以 agent 身份写一条
+       终止消息把图落地 —— 否则同会话的下一个任务会永远 409。
+
+    两步都幂等: 已经在跑就停, 没在跑就只做收尾; 没有挂起就什么都不做。
+    Java 侧的超时重发、运维连点两下都不会造成二次破坏。
+
+    ★ 为什么要先停再收尾 ★
+
+    反过来会有一个窗口: 收尾刚把 ``next`` 清空, 还在跑的图紧接着又写回
+    一个挂起快照 —— 收尾等于没做。先 cancel 并等它真正结束 (最多 10 秒),
+    再动 checkpoint。
+
+    ★ 返回值 ★
+
+    ``stopped`` = 本地确实有一个运行被停了; ``released`` = 挂起状态确实
+    被清掉了。两者独立: 进程重启后原任务早已不在内存里, 但挂起仍在,
+    这时 stopped=false / released=true 是完全正常的。
+
+    ★ 前提 ★
+
+    单实例: 运行登记在进程内的 ``_RUNNING`` 里。多实例部署时取消请求必须
+    路由到持有该运行的实例 (或者改成广播 + Redis 登记), 否则只能收尾、
+    停不掉正在跑的 LLM 调用。
+    """
+    if state.agent is None:
+        raise HTTPException(status_code=503, detail=f"Agent 未就绪: {state.startup_error}")
+
+    task_id = (task_id or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id 不能为空")
+
+    session_id = ((req.session_id if req else None) or "").strip() or None
+    tenant_id = ((req.tenant_id if req else None) or "").strip() or None
+    trace_id = ((req.trace_id if req else None) or "").strip() or None
+    reason = ((req.reason if req else None) or "").strip() or None
+
+    # ---- 1. 停掉正在跑的 ainvoke ----
+    stopped = False
+    run = _RUNNING.get(task_id)
+    if run is not None and not run.done():
+        run.cancel()
+        try:
+            # 等它真的退出, 不是"发出取消就返回"。图的 checkpoint 写入是
+            # 异步的, 不等的话下一步收尾会和它抢同一份快照。
+            # 10 秒是防御性上限: 正常取消 (LLM/工具都是可取消的 await)
+            # 在毫秒级完成; 真有节点赖着不走, 也不能把控制面的请求拖死。
+            await asyncio.wait_for(asyncio.shield(run), timeout=10.0)
+        except (TimeoutError, asyncio.CancelledError):
+            # TimeoutError: 取消已发出但还没落地, 下面照常尝试收尾。
+            # CancelledError: 被取消的正是 run 本身 —— 这是预期路径,
+            # 不是本协程自己被取消, 所以吞掉继续。
+            pass
+        except Exception as ex:  # noqa: BLE001 - run 的异常由 /chat 自己上报
+            # /chat 那边会把它翻译成 FAILED + 500。这里只是"顺手等到了"
+            # 它的结局, 不该让取消失败。
+            logger.debug(
+                "取消等待运行结束时收到异常 (由 /chat 负责上报): %s",
+                describe_exception(ex),
+            )
+        stopped = run.cancelled()
+        logger.info(
+            "取消请求 task=%s trace=%s stopped=%s reason=%s",
+            task_id, trace_id, stopped, reason or "-",
+        )
+    else:
+        logger.info(
+            "取消请求 task=%s trace=%s 没有在跑的运行 (只收尾 checkpoint) reason=%s",
+            task_id, trace_id, reason or "-",
+        )
+
+    # ---- 2. 收尾挂起状态 ----
+    thread_id = resolve_thread_id(
+        session_id=session_id,
+        tenant_id=tenant_id,
+        task_id=task_id,
+    )
+    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    # metadata 要和 /chat 写的一致, 否则收尾产生的 checkpoint 会"没有归属",
+    # 语义上变成一次自由对话 —— 后续任务的归属判断会读到 None。
+    config["metadata"] = {
+        "task_id": task_id,
+        "trace_id": trace_id,
+        "session_id": session_id,
+    }
+
+    # 和 /chat 用同一把锁: 收尾不能和"同会话下一个任务的开跑"交错。
+    async with _thread_lock(thread_id):
+        released = await release_pending(state.agent, config, task_id=task_id)
+
+    return {
+        "task_id": task_id,
+        "thread_id": thread_id,
+        "stopped": stopped,
+        "released": released,
+        "reason": reason,
+    }
