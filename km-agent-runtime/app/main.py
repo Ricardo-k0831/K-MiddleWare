@@ -908,6 +908,11 @@ async def cancel_task(task_id: str, req: CancelRequest | None = None) -> dict[st
     stopped = False
     run = _RUNNING.get(task_id)
     if run is not None and not run.done():
+        # 每一个run都是一个独立的协程
+        #
+        #
+        #
+        # 包装着state.agent.ainvoke(payload, config=config)
         run.cancel()
         try:
             # 等它真的退出, 不是"发出取消就返回"。图的 checkpoint 写入是

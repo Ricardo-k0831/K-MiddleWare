@@ -12,28 +12,29 @@ Python 做数据面（Agent 编排、推理、RAG），MCP 协议打通两边。
 ## 架构
 
 ```
-                    ┌─────────────────────────────────────┐
-   用户请求 ────────▶│  Java 控制面 (Spring Boot 4 / Java 21) │
-                    │                                     │
-                    │  · MCP 工具网关  ← 安全边界, 所有    │
-                    │    Agent 对业务的调用都从这里过      │
-                    │  · 任务状态事实源 (MySQL)            │
-                    │  · 权限 / 限流 / 熔断 / 审计         │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    RocketMQ 异步任务投递 / 回调
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │  Python Agent 运行时 (FastAPI)       │
-                    │                                     │
-                    │  · LangGraph 多 Agent 编排           │
-                    │  · MCP Client (协议适配层)           │
-                    │  · 分层记忆 (Redis / PGVector / MySQL)│
-                    └──────────────┬──────────────────────┘
+                    ┌─────────────────────────────────────────────┐
+  用户请求 ────────▶│  Java 控制面 (Spring Boot 4 / Java 21)      │
+                    │                                             │
+                    │  km-mcp-server   MCP 工具网关               │
+                    │    ← 安全边界, 所有调用都过这里             │
+                    │  km-task-service 任务状态事实源             │
+                    │    状态机 / 重试 / 心跳 / 取消              │
+                    │  km-audit-core   四层审计汇聚               │
+                    │  （权限 / 限流 / 熔断: 规划中）             │
+                    └──────────────┬──────────────────────────────┘
+                                   │ 派发: HTTP /chat
+                                   │ 审计: RocketMQ → audit_log
+                    ┌──────────────▼──────────────────────────────┐
+                    │  Python Agent 运行时 (FastAPI)              │
+                    │                                             │
+                    │  · LangGraph ReAct Agent                    │
+                    │  · MCP Client (协议适配层)                  │
+                    │  · 会话身份 + Postgres 断点续跑             │
+                    └──────────────┬──────────────────────────────┘
                                    │ MCP over Streamable HTTP
-                    ┌──────────────▼──────────────────────┐
-                    │  存量 Java 微服务 (零改造)            │
-                    └─────────────────────────────────────┘
+                    ┌──────────────▼──────────────────────────────┐
+                    │  存量 Java 微服务 (零改造)                  │
+                    └─────────────────────────────────────────────┘
 ```
 
 ---
@@ -75,7 +76,13 @@ mvn -pl km-mock-order-service spring-boot:run
 
 # 终端 2 — MCP 工具网关（8081）
 mvn -pl km-mcp-server spring-boot:run
+
+# 终端 3 — 任务服务（8083）：状态机 / 重试 / 心跳 / 取消 / 审计入口
+mvn -pl km-task-service spring-boot:run
 ```
+
+> 刚跑过服务就别再 `mvn install` —— 运行中的 JVM 加载着旧 jar，覆盖 target 会
+> 让下一次类加载报 `NoClassDefFoundError: X$2`。先停服务再构建。
 
 ### 3. 起 Python Agent 运行时
 
@@ -86,17 +93,54 @@ uv sync --extra dev
 # ★ 先验证 MCP 链路，再写任何业务代码
 uv run pytest tests/test_mcp_handshake.py -v -s
 
-uv run uvicorn app.main:app --reload --port 8000
+# 内存记忆（重启即丢）：
+uv run uvicorn app.main:app --port 8000
+
+# 持久化记忆 + 断点续跑（需要 docker 里的 PostgreSQL）：
+CHECKPOINT_BACKEND=postgres uv run uvicorn app.main:app --port 8000 \
+  --loop asyncio:SelectorEventLoop
 ```
+
+> **Windows 上必须换事件循环**：psycopg 的异步连接不能跑在
+> `ProactorEventLoop`（Windows 默认）上。持久化后端请加
+> `--loop asyncio:SelectorEventLoop`，或者用 `--reload`（uvicorn 会自己选）。
+> 否则启动直接报 `NotImplementedError`。
 
 ### 4. 验证端到端
 
 ```bash
+# 工具发现（走 MCP 网关）
 curl http://localhost:8000/agent/tools
+
+# 自由对话（不建任务，不回调 Java）
 curl -X POST http://localhost:8000/chat \
   -H 'Content-Type: application/json' \
   -d '{"message":"帮我查一下订单 SO20260901001 的状态","thread_id":"t1"}'
+
+# 任务链路：先建任务，再带着任务身份调 /chat
+curl -X POST http://localhost:8083/api/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":"U1001","sessionId":"s-demo","intent":"查订单","tenantId":"demo","maxRetry":1}'
+# 把响应里的 agentTaskId / traceId / sessionId 原样转交：
+curl -X POST http://localhost:8000/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"帮我查一下订单 SO20260901001 的状态",
+       "task_id":"<agentTaskId>","trace_id":"<traceId>",
+       "tenant_id":"demo","actor":"U1001","session_id":"s-demo"}'
+
+# 查最终状态与事件链
+curl http://localhost:8083/api/tasks/<agentTaskId>
+curl http://localhost:8083/api/tasks/<agentTaskId>/events
 ```
+
+`trace_id` 只能来自任务创建（或重试）的响应 —— Python 不生成它。缺了会 400，
+补一个假的则会让同一遍执行在审计里劈成两条对不上的链路。
+
+### 5. 详细文档
+
+- [`docs/task-state-machine.md`](docs/task-state-machine.md) — 状态机、重试、心跳兜底、
+  取消、会话/线程身份与断点续跑的完整设计
+- [`docs/audit.md`](docs/audit.md) — 四层审计的数据模型、投递链路、身份核对与已知边界
 
 ---
 
@@ -151,6 +195,9 @@ Agent 拿到的能力本身就是被限制过的。
 **为什么**：安全边界必须收敛在单一位置。如果 Python 也做一层权限判断，
 两套规则迟早会不一致，而不一致的那一侧就是漏洞。
 
+> **现状（2026-11-09）**：边界的位置已经定死，**裁剪本身还没实现** ——
+> 网关目前全量暴露工具。这是 Phase 2 的第一项，不是已完成能力。
+
 ### 4. 存量微服务零改造
 
 `km-mock-order-service` 里**故意**没有任何 MCP / AI 相关代码。
@@ -169,18 +216,24 @@ K_middleware/
 │   └── init/                     MySQL 建表 / pgvector 扩展 / RocketMQ 配置
 ├── km-control-plane/             Java 控制面
 │   ├── km-mock-order-service/    模拟存量微服务（8082，零改造）
-│   └── km-mcp-server/            MCP 工具网关（8081）
-└── km-agent-runtime/             Python Agent 运行时（8000）
-    ├── app/mcp_adapter/          ★ MCP 协议适配层
-    ├── app/graph/                LangGraph 编排
-    └── tests/                    ★ 含 MCP 握手验收测试
+│   ├── km-mcp-server/            MCP 工具网关（8081）
+│   ├── km-task-service/          任务服务（8083）：状态机 / 重试 / 心跳 / 取消
+│   ├── km-audit-core/            审计公共库：事件模型 + RocketMQ 投递 + 采样
+│   └── scripts/                  验收脚本（状态机 / 重试 / 心跳 / 审计链路）
+├── km-agent-runtime/             Python Agent 运行时（8000）
+│   ├── app/mcp_adapter/          ★ MCP 协议适配层
+│   ├── app/graph/                LangGraph 编排
+│   ├── app/checkpoint.py         会话记忆后端（memory / postgres）
+│   └── tests/                    ★ 含 MCP 握手、任务链路、审计、断点续跑测试
+├── docs/                         设计文档（状态机 / 审计）
+└── docker/migrations/            增量迁移（老 volume 不会重跑 init 里的建表）
 ```
 
 ---
 
 ## 开发路线
 
-### Phase 1 — MVP（当前）
+### Phase 1 — MVP（已跑通，剩两项）
 
 目标：**端到端跑通**，架构故事完整。
 
@@ -190,14 +243,22 @@ K_middleware/
 - [x] Python MCP Client + 协议适配层
 - [x] LangGraph ReAct Agent
 - [x] **验证 MCP 握手** ← ✅ 2026-09-17 实测通过，见上方「MCP 协议版本」
-- [ ] 接 LLM 跑通完整 Agent 对话（需要先配 `.env` 里的 LLM_API_KEY）
-- [ ] RocketMQ 异步任务投递
-- [ ] 任务状态机 + 回调 Java
-- [ ] 基础 RAG 语义记忆
+- [x] **接真模型跑通完整对话**（DeepSeek + 真实工具调用）← ✅ 2026-11-09
+- [x] 任务状态机 + 回调 Java（PENDING / THINKING / TOOL_CALLING / COMPLETED / FAILED / CANCELLED）
+- [x] 失败重试（手动 + 定时自动）与心跳兜底
+- [x] 取消：Java 先落库，Python 协作终止并释放 checkpoint
+- [x] 四层审计（AGENT_RUNTIME / MCP_GATEWAY / LEGACY_SERVICE / TASK_SERVICE）→ RocketMQ → `audit_log`
+- [x] 会话记忆（`session:<tenant>:<session_id>`）+ Postgres 断点续跑
+- [ ] RocketMQ **异步任务派发** —— 架构图上的那一块，现在派发仍是 HTTP，MQ 只用于审计汇聚
+- [ ] 基础 RAG 语义记忆 —— pgvector 容器已就绪，尚未接入
 
 ### Phase 2 — 企业特性
 
-分层记忆完善、全链路 OTel 追踪、Token 指标、Prompt 注入防护、任务断点恢复、SSE 流式输出。
+- [ ] 网关权限裁剪 / 限流 / 熔断（README 前半部分描述的是**目标态**，尚未实现）
+- [ ] 控制面鉴权（`/api/tasks` 目前无认证，审计的 `actor` 只是任务归属人）
+- [ ] 全链路 OTel 追踪、Token 指标、Micrometer 指标与审计采样率策略
+- [ ] Prompt 注入防护
+- [ ] SSE 流式输出
 
 ### Phase 3 — 高阶亮点（可选）
 

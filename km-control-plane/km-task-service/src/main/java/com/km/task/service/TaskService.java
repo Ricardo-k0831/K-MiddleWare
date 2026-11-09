@@ -511,7 +511,9 @@ public class TaskService {
      * @return 更新后的任务 (状态 CANCELLED)
      */
     @Transactional
-    public AgentTask cancel(String agentTaskId, String reason) {
+    public AgentTask
+
+    cancel(String agentTaskId, String reason) {
         AgentTask task = requireTask(agentTaskId);
         TaskStatus from = parseStatus(task);
 
@@ -527,9 +529,8 @@ public class TaskService {
                     "任务已结束 (当前状态 " + from + ")");
         }
 
-        // 当前还没闭链的那次执行。正常情况下恰好一条 (create 时建的那条),
-        // 但防御性地按"查不到也能取消"处理: 数据不一致时, 让它停在
-        // THINKING 比取消不动它更糟。
+        // 查找闭链的 Attempt 执行。正常情况下恰好一条 (create 时建的那条),
+        // 但防御性地按"查不到也能取消"处理: 数据不一致时, 让它停在THINKING 比取消不动它更糟。
         AgentTaskAttempt attempt = attemptMapper.selectOne(
                 Wrappers.<AgentTaskAttempt>lambdaQuery()
                         .eq(AgentTaskAttempt::getAgentTaskId, agentTaskId)
@@ -539,6 +540,7 @@ public class TaskService {
         String trimmedReason = isBlank(reason) ? null : reason.trim();
         LocalDateTime now = LocalDateTime.now();
 
+        // 更新agentTask表的状态
         int affected = taskMapper.update(null, Wrappers.<AgentTask>lambdaUpdate()
                 .eq(AgentTask::getAgentTaskId, agentTaskId)
                 .eq(AgentTask::getStatus, from.name())
@@ -546,8 +548,9 @@ public class TaskService {
                 .set(AgentTask::getUpdatedAt, now)
                 .set(AgentTask::getFinishedAt, now));
 
+        // 更新失败
         if (affected == 0) {
-            // 读到写之间被人改了。并发取消 → 幂等返回; 被别人改成别的状态
+            // 判断是否是并发取消 → 幂等返回; 被别人改成别的状态
             // (比如 Python 恰好报了 COMPLETED) → 拒绝, 让调用方重新读。
             AgentTask latest = requireTask(agentTaskId);
             if (TaskStatus.CANCELLED.name().equals(latest.getStatus())) {
@@ -566,18 +569,21 @@ public class TaskService {
             detail.put("attemptNo", attempt.getAttemptNo());
             putIfPresent(detail, "cancelledTraceId", attempt.getTraceId());
         }
+        //更新任务状态变更记录表
         appendEvent(agentTaskId, from, TaskStatus.CANCELLED,
                 TaskEventSource.JAVA_GATEWAY, detail);
+        // 关闭执行记录 / 闭链
         if (attempt != null) {
             closeAttempt(attempt, TaskStatus.CANCELLED, now);
         }
 
         AgentTask updated = requireTask(agentTaskId);
 
-        // 审计的 trace 用【被取消的那次执行】的, 而不是任务表上可能已经
-        // 指向别处的滚动值。取消属于那次执行的最后一件事, 归到它名下,
+        // 审计的 trace 用【被取消的那次执行】的, 而不是任务表上可能已经指向别处的滚动值。
+        // 取消属于那次执行的最后一件事, 归到它名下,
         // 事后按 trace 查"这次执行为什么没跑完"才能查到。
         String auditTrace = attempt != null ? attempt.getTraceId() : updated.getTraceId();
+        // 发布状态变更审计事件
         audit.publish(AuditEvent.builder()
                 .taskId(agentTaskId)
                 .traceId(auditTrace)

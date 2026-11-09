@@ -70,8 +70,8 @@ public class PythonCancelNotifier {
     public CancelTaskResponse.RuntimeStop notify(AgentTask task, String reason) {
         String taskId = task.getAgentTaskId();
 
-        // session_id / tenant_id 是 Python 算线程身份的必要输入 —— 少了
-        // session_id, 它会去收尾"任务线程", 而那次运行其实在会话线程上,
+        // session_id / tenant_id 是 Python 算线程身份的必要输入 ——
+        // 少了session_id, 它会去收尾"任务线程", 而那次运行其实在会话线程上,
         // 收尾就打空了, 会话继续被占着。
         Map<String, Object> body = new LinkedHashMap<>();
         putIfPresent(body, "session_id", task.getSessionId());
