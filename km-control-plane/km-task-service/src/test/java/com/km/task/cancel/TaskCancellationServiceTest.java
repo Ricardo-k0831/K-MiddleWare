@@ -42,7 +42,7 @@ class TaskCancellationServiceTest {
     @Test
     void 先改状态再通知运行时() {
         AgentTask cancelled = task();
-        when(taskService.cancel("task-1", "reason")).thenReturn(cancelled);
+        when(taskService.cancel("task-1", "reason", null)).thenReturn(cancelled);
         CancelTaskResponse.RuntimeStop runtime =
                 new CancelTaskResponse.RuntimeStop(true, true, true, "session:km:s-1", null);
         when(notifier.notify(cancelled, "reason")).thenReturn(runtime);
@@ -51,7 +51,7 @@ class TaskCancellationServiceTest {
 
         // 断言顺序: 两个 mock 都在同一个线程里同步调用, InOrder 能钉住先后。
         var order = inOrder(taskService, notifier);
-        order.verify(taskService).cancel("task-1", "reason");
+        order.verify(taskService).cancel("task-1", "reason", null);
         order.verify(notifier).notify(cancelled, "reason");
 
         assertEquals(cancelled, response.task());
@@ -60,7 +60,7 @@ class TaskCancellationServiceTest {
 
     @Test
     void 状态变更失败时根本不通知运行时() {
-        when(taskService.cancel("task-1", null))
+        when(taskService.cancel("task-1", null, null))
                 .thenThrow(new CancellationNotAllowedException("task-1", "已 COMPLETED"));
 
         assertThrows(CancellationNotAllowedException.class,
@@ -74,7 +74,7 @@ class TaskCancellationServiceTest {
     @Test
     void 运行时通知失败不影响取消结果() {
         AgentTask cancelled = task();
-        when(taskService.cancel(eq("task-1"), any())).thenReturn(cancelled);
+        when(taskService.cancel(eq("task-1"), any(), any())).thenReturn(cancelled);
         when(notifier.notify(cancelled, null))
                 .thenReturn(CancelTaskResponse.RuntimeStop.unreachable("Connection refused"));
 

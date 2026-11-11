@@ -36,6 +36,10 @@ TRACE_ID = "cffac16e00000000cffac16e00000000"
 SETTINGS = SimpleNamespace(
     km_task_service_url="http://java:8083",
     km_task_service_timeout_seconds=2.0,
+    # 控制面鉴权 (2026-11-09) 起, 这道入口校验的 GET 也要带 SERVICE 密钥 ——
+    # 不带的话 Java 回 401, 表现是"所有带 task_id 的 /chat 都 502"。
+    # 用一个明显的假值, 下一个用例会断言它真的出现在请求头上。
+    km_task_service_api_key="service-key-for-test",
 )
 
 
@@ -68,6 +72,7 @@ def test_trace一致时放行() -> None:
     def handle(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
         seen["method"] = request.method
+        seen["api_key"] = request.headers.get("X-KM-Api-Key")
         return _task_response(TRACE_ID)
 
     _run(handle)
@@ -75,6 +80,9 @@ def test_trace一致时放行() -> None:
     assert seen["method"] == "GET"
     # 打的是任务查询接口 —— 换成别的路径就等于这道校验悄悄失效了
     assert seen["url"] == f"http://java:8083/api/tasks/{TASK_ID}"
+    # ★ 鉴权头不能漏 ★ 漏了 Java 回 401, 而这边会把它归进"Java 不可达/5xx"
+    # 的 502 分支 —— 报错信息指向网络, 真正的原因却是少了一个头。
+    assert seen["api_key"] == "service-key-for-test"
 
 
 # ----------------------------------------------------------------------

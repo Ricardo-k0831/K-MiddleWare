@@ -60,6 +60,7 @@ Agent 挂了 checkpointer 之后, 同一个 thread_id 会【跨运行累积历�
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import uuid
 
@@ -72,6 +73,12 @@ if hasattr(sys.stdout, "reconfigure"):
 AGENT_BASE = "http://localhost:8000"
 ORDER_BASE = "http://localhost:8082"
 TASK_BASE = "http://localhost:8083"
+
+# 控制面认证: 脚本用 SERVICE 身份 (租户通配, 可上报状态)。
+# 只在调用 8083 时带 —— /chat 是 Python 的接口, 不认识这个头也无妨, 但没必要。
+CONTROL_HEADERS = {
+    "X-KM-Api-Key": os.environ.get("KM_CONTROL_SERVICE_KEY", "dev-service-key-change-me")
+}
 
 # 任务状态里哪些算终态。与 Java 的 TaskStatus.isTerminal() 对齐。
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
@@ -207,7 +214,8 @@ def preflight_task(client: httpx.Client) -> str | None:
     8083 没起来时, 你仍然应该能跑完 A-D —— 那四个用例和任务链路无关。
     """
     try:
-        r = client.get(f"{TASK_BASE}/api/tasks/__probe__{RUN_ID}", timeout=5.0)
+        r = client.get(f"{TASK_BASE}/api/tasks/__probe__{RUN_ID}",
+                       headers=CONTROL_HEADERS, timeout=5.0)
         if r.status_code != 404:
             return f"km-task-service (:8083) 返回 HTTP {r.status_code}, 期望 404"
     except Exception as ex:
@@ -308,6 +316,7 @@ def create_task(client: httpx.Client, intent: str) -> tuple[dict | None, str]:
     try:
         r = client.post(
             f"{TASK_BASE}/api/tasks",
+            headers=CONTROL_HEADERS,
             json={
                 "userId": "U1001",
                 "sessionId": f"smoke-{RUN_ID}-{uuid.uuid4().hex[:6]}",
@@ -327,7 +336,8 @@ def create_task(client: httpx.Client, intent: str) -> tuple[dict | None, str]:
 
 def fetch_task(client: httpx.Client, task_id: str) -> dict | None:
     try:
-        r = client.get(f"{TASK_BASE}/api/tasks/{task_id}", timeout=10.0)
+        r = client.get(f"{TASK_BASE}/api/tasks/{task_id}",
+                       headers=CONTROL_HEADERS, timeout=10.0)
         return r.json() if r.status_code == 200 else None
     except Exception:
         return None
@@ -335,7 +345,8 @@ def fetch_task(client: httpx.Client, task_id: str) -> dict | None:
 
 def fetch_events(client: httpx.Client, task_id: str) -> tuple[list | None, str]:
     try:
-        r = client.get(f"{TASK_BASE}/api/tasks/{task_id}/events", timeout=10.0)
+        r = client.get(f"{TASK_BASE}/api/tasks/{task_id}/events",
+                       headers=CONTROL_HEADERS, timeout=10.0)
     except Exception as ex:
         return None, f"查事件失败: {type(ex).__name__}: {ex}"
     if r.status_code != 200:
@@ -446,10 +457,21 @@ def run_task_case(client: httpx.Client, case: dict, show_reply: bool) -> bool:
         failures.append(
             f"响应里的 task_id 回显不对: 期望 {task_id!r}, 实际 {data.get('task_id')!r}"
         )
-    if data.get("thread_id") != task_id:
+    # ★ 2026-11-04 会话身份改造后, thread 是【会话】而不是任务 ★
+    #   session_id 有值 → thread_id = "session:<tenant>:<session_id>"
+    # 任务不再占 thread, 而是以 metadata.task_id 标在 checkpoint 上。
+    # 这条断言要同时钉住两件事: 格式对 (会话维度) 且【不是】task_id ——
+    # 退回"一个任务一个 thread"会让同一会话里的多轮记忆断开。
+    expected_thread = f"session:{task.get('tenantId')}:{task.get('sessionId')}"
+    if data.get("thread_id") != expected_thread:
         failures.append(
-            f"任务链路下 thread_id 应当就是 task_id, 实际 {data.get('thread_id')!r}\n"
-            "       —— 两者不一致的话, 断点续跑会找不到上次的 checkpoint"
+            f"任务链路下 thread_id 应当按会话推出: 期望 {expected_thread!r}, "
+            f"实际 {data.get('thread_id')!r}\n"
+            "       —— 对不上的话, 同一会话的后续轮次会读到另一个 checkpoint"
+        )
+    if data.get("thread_id") == task_id:
+        failures.append(
+            "thread_id 退回了 task_id —— 会话记忆会被按任务切开 (见 2026-11-04 改造)"
         )
     if actual_tools != case["expect_tools"]:
         failures.append(f"工具调用轨迹不符: 期望 {case['expect_tools']}, 实际 {actual_tools}")

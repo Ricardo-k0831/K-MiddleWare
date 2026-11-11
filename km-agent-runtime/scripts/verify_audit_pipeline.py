@@ -32,6 +32,7 @@ Java 的 POST /api/tasks 生成 —— 所以这个脚本必须先建任务, 再
 
 from __future__ import annotations
 
+import os
 import sys
 
 import httpx
@@ -41,6 +42,12 @@ if hasattr(sys.stdout, "reconfigure"):
 
 TASK_SERVICE = "http://127.0.0.1:8083"
 AGENT_RUNTIME = "http://127.0.0.1:8000"
+
+# 控制面认证: 这个脚本代表"服务"去建任务, 且要指定 tenantId=km,
+# 所以必须用 SERVICE 密钥 (租户通配)。值必须和 Java 的 KM_CONTROL_SERVICE_KEY 一致。
+CONTROL_HEADERS = {
+    "X-KM-Api-Key": os.environ.get("KM_CONTROL_SERVICE_KEY", "dev-service-key-change-me")
+}
 
 INTENT = "查一下订单 SO20260901001 的物流"
 USER_ID = "u-audit-verify"
@@ -52,6 +59,7 @@ def main() -> int:
         # ---- 第 1 步: 建任务。trace_id 由 Java 生成, 见 TaskService.create ----
         created = client.post(
             f"{TASK_SERVICE}/api/tasks",
+            headers=CONTROL_HEADERS,
             json={
                 "userId": USER_ID,
                 "sessionId": "s-audit-verify",

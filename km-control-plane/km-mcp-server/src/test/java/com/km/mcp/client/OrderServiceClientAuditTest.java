@@ -5,6 +5,8 @@ import com.km.audit.AuditLayer;
 import com.km.mcp.audit.AuditCapture;
 import com.km.mcp.audit.TaskIdentity;
 import com.km.mcp.client.OrderServiceClient.OrderServiceException;
+import com.km.mcp.guard.BackendCircuitBreaker;
+import com.km.mcp.guard.GatewayGuardProperties;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
@@ -49,7 +51,12 @@ class OrderServiceClientAuditTest {
     void setUp() {
         RestClient.Builder builder = RestClient.builder();
         backend = MockRestServiceServer.bindTo(builder).build();
-        client = new OrderServiceClient(builder, "http://backend:8082", capture.publisher());
+        // 熔断关掉: 这个类只测审计, 不能因为连续 500 把熔断打开而让后面的
+        // 用例看到"调用没发出去" —— 那是 BackendCircuitBreakerTest 的事。
+        GatewayGuardProperties guard = new GatewayGuardProperties();
+        guard.getCircuitBreaker().setEnabled(false);
+        client = new OrderServiceClient(builder, "http://backend:8082", capture.publisher(),
+                new BackendCircuitBreaker(guard));
     }
 
     // ------------------------------------------------------------------

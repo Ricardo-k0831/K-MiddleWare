@@ -259,6 +259,71 @@ POST   /api/tasks/{id}/cancel          主动取消任务      -> 任务 + 运�
 409 表示"别再跳了"（trace 对不上，或这次执行已经结束）。详见
 [心跳兜底](#心跳兜底2026-10-31)。
 
+### 控制面鉴权（2026-11-09）
+
+在此之前 `/api/tasks/**` 是完全开放的：任何人能建任务、改状态、取消别人的执行。
+审计里记的 `actor` 也只能取任务归属人——它回答"这是谁的任务"，回答不了
+"刚才是谁动的"。
+
+没有统一认证中心的前提下，这一版用**共享密钥 + 密钥表**：
+
+```yaml
+km:
+  control-auth:
+    enabled: true            # 默认开, 关了会 WARN
+    keys:
+      - key: dev-user-key-change-me
+        tenant: demo
+        user: demo-user
+        role: USER
+      - key: dev-service-key-change-me
+        tenant: "*"
+        user: python-runtime
+        role: SERVICE
+```
+
+请求头固定为 `X-KM-Api-Key`（Python 侧同名常量在 `app/control_auth.py`）。
+
+**两个角色，边界比租户更硬：**
+
+| 角色 | 能做什么 | 不能做什么 |
+| --- | --- | --- |
+| `USER` | 建任务 / 查自己的任务 / 取消 / 重试 | 上报状态、发心跳 |
+| `SERVICE` | 上报状态、发心跳；建任意租户的任务 | —— |
+
+不允许 `USER` 上报状态，是因为**状态必须由真正执行的那一方报**。否则一个拿到
+用户密钥的脚本就能伪造 `COMPLETED`，状态机的事实源就不再是事实源。
+
+**错误码的语义分工：**
+
+- 没有密钥 / 密钥不匹配 → **401 `UNAUTHENTICATED`**
+- 有密钥但角色不够（USER 调 `/status` 或 `/heartbeat`）→ **403 `FORBIDDEN`**
+- 跨租户读/改**已存在的任务** → **404 `TASK_NOT_FOUND`**，不是 403
+- 建任务时**请求体显式声明了别的租户** → **403 `FORBIDDEN`**
+
+第三种是刻意的：403 等于告诉对方"这个 ID 存在，只是你无权看"——对任务 ID
+来说那就是一个可枚举的存在性探针。让跨租户和"真的不存在"不可区分，泄露面
+才是零。第四种反过来：租户名是调用方自己写进请求体的，不存在信息泄露，
+回 403 能让调用方知道参数写错了。
+
+**actor 进审计：** 通过认证的取消/重试会把 `caller.userId()` 传进
+`TaskService`，审计里的 `actor` 从此是"真正点按钮的人"，而不是任务归属用户。
+内部调用（`RetryScheduler` 的自动重试）显式传 `"system"`——为空会退回任务
+归属人，审计里看起来像是用户自己点的重试，误导排查。
+
+**默认值的选择：** 默认开启 + 开发密钥。默认开才会在本地就跑起来，而不是
+"生产记得开"；开发密钥写在被 git 跟踪的配置里，不是秘密，启动日志会专门
+WARN 一次，生产用 `KM_CONTROL_USER_KEY` / `KM_CONTROL_SERVICE_KEY` 覆盖。
+`enabled=false` 是明确关闭（本地临时调试用），同样会 WARN——安全开关不能
+静默失效。
+
+**为什么用 request attribute 而不是 ThreadLocal：** 请求一进线程池，
+ThreadLocal 的清理就依赖 `finally`，漏一次就是"上一个请求的身份跟着下一个
+请求跑"。过滤器写 `km.control.caller`，Controller 用 `@RequestAttribute` 读，
+生命周期和请求本身绑定。
+
+验收脚本：`km-control-plane/scripts/verify_control_auth.py`（25 项）。
+
 ### 一次状态上报，Java 做五件事
 
 1. **校验执行身份** —— `traceId` 必须对应该任务的一次未闭链执行，否则 409

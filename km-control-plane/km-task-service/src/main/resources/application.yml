@@ -116,6 +116,31 @@ km:
     probe-connect-timeout-seconds: ${KM_HEARTBEAT_PROBE_CONNECT_TIMEOUT_SECONDS:3}
     probe-timeout-seconds: ${KM_HEARTBEAT_PROBE_TIMEOUT_SECONDS:5}
 
+  # 控制面接口认证 (见 com.km.task.auth)
+  #
+  # ★ 默认开启 ★ 安全开关静默失效比不方便更糟, 所以默认就要求带
+  # X-KM-Api-Key。本地调试要临时关掉时用:
+  #   KM_CONTROL_AUTH_ENABLED=false mvn spring-boot:run
+  #
+  # 角色:
+  #   USER    —— 人/脚本: 建任务、查、取消、重试; 只能碰自己租户的任务
+  #   SERVICE —— Python 运行时: 上报状态、发心跳; 租户通配
+  #
+  # 下面两个 key 是开发占位值 (写在 git 里, 不是秘密), 生产用环境变量覆盖,
+  # 启动日志会对默认值各 WARN 一次。Python 侧的
+  # km_task_service_api_key 必须和 SERVICE 那个一致。
+  control-auth:
+    enabled: ${KM_CONTROL_AUTH_ENABLED:true}
+    keys:
+      - key: ${KM_CONTROL_USER_KEY:dev-user-key-change-me}
+        tenant: demo
+        user: demo-user
+        role: USER
+      - key: ${KM_CONTROL_SERVICE_KEY:dev-service-key-change-me}
+        tenant: "*"
+        user: python-runtime
+        role: SERVICE
+
 logging:
   level:
     com.km.task: DEBUG

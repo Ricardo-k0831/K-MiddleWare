@@ -28,10 +28,20 @@ public class TaskCancellationService {
      * @return 任务 (已 CANCELLED) + 运行时的处理结果
      */
     public CancelTaskResponse cancel(String agentTaskId, String reason) {
+        // 内部调用 (测试 / 脚本直调) 没有身份信息, 保持旧签名;
+        // 审计的 actor 会退回任务归属人, 见 TaskService.cancel。
+        return cancel(agentTaskId, reason, null);
+    }
+
+    /**
+     * @param actor 发起取消的人 (来自控制面认证)。null = 没有身份信息
+     * @return 任务 (已 CANCELLED) + 运行时的处理结果
+     */
+    public CancelTaskResponse cancel(String agentTaskId, String reason, String actor) {
         // ① 事务内: 状态机校验 + CAS + 事件 + 闭链 + 审计。
         //    抛异常 (任务已结束/并发冲突) 时, 下面的通知不会执行 ——
         //    这正是我们要的: 没取消成功就不要打扰运行时。
-        AgentTask task = taskService.cancel(agentTaskId, reason);
+        AgentTask task = taskService.cancel(agentTaskId, reason, actor);
 
         // ② 事务外: 最好的情况是停掉正在跑的调用并释放会话线程;
         //    最坏的情况是连不上, 只记日志。无论哪种, ①都已经生效。

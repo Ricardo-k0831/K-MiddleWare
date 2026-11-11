@@ -1,8 +1,10 @@
 package com.km.task.web;
 
+import com.km.task.auth.CallerIdentity;
 import com.km.task.cancel.TaskCancellationService;
 import com.km.task.domain.AgentTask;
 import com.km.task.domain.AgentTaskEvent;
+import com.km.task.domain.TaskEventSource;
 import com.km.task.service.TaskService;
 import com.km.task.web.dto.CancelTaskRequest;
 import com.km.task.web.dto.CancelTaskResponse;
@@ -16,6 +18,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestAttribute;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -67,27 +70,42 @@ public class TaskController {
     }
 
     // 请求路径 /api/tasks. 创建任务
+    //
+    // 租户不再直接取请求体: USER 密钥只能在自己租户下建任务, SERVICE
+    // (Python 运行时) 才能替任意租户建。判断在 CallerIdentity 里,
+    // Controller 只负责把结果交给 Service —— 这里出现 if 就是设计跑偏。
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     // 并且自动生成 trace_id
-    public AgentTask create(@Valid @RequestBody CreateTaskRequest request) {
+    public AgentTask create(@Valid @RequestBody CreateTaskRequest request,
+                            @RequestAttribute(CallerIdentity.ATTRIBUTE) CallerIdentity caller) {
         return taskService.create(
                 request.userId(),
                 request.sessionId(),
                 request.intent(),
-                request.tenantId(),
+                caller.resolveCreateTenant(request.tenantId()),
                 request.maxRetry());
     }
 
     // 请求路径 /api/tasks/{id}. 查询任务
+    //
+    // 跨租户的读取按"不存在"处理 (404), 不给存在性探针 —— 见 CallerIdentity。
     @GetMapping("/{agentTaskId}")
-    public AgentTask get(@PathVariable String agentTaskId) {
-        return taskService.requireTask(agentTaskId);
+    public AgentTask get(@PathVariable String agentTaskId,
+                         @RequestAttribute(CallerIdentity.ATTRIBUTE) CallerIdentity caller) {
+        AgentTask task = taskService.requireTask(agentTaskId);
+        caller.requireTaskVisible(agentTaskId, task.getTenantId());
+        return task;
     }
 
     // 请求路径 /api/tasks/{id}/events. 查询任务状态流转历史
     @GetMapping("/{agentTaskId}/events")
-    public List<AgentTaskEvent> events(@PathVariable String agentTaskId) {
+    public List<AgentTaskEvent> events(@PathVariable String agentTaskId,
+                                       @RequestAttribute(CallerIdentity.ATTRIBUTE) CallerIdentity caller) {
+        // 先读一次任务做租户判断。多一次查询换来的是"事件表不因为
+        // 知道 ID 就能被翻" —— 事件里包含 trace、错误原因, 泄露面更大。
+        AgentTask task = taskService.requireTask(agentTaskId);
+        caller.requireTaskVisible(agentTaskId, task.getTenantId());
         return taskService.listEvents(agentTaskId);
     }
 
@@ -124,8 +142,18 @@ public class TaskController {
      */
     @PostMapping("/{agentTaskId}/retry")
     public AgentTask retry(@PathVariable String agentTaskId,
-                           @Valid @RequestBody(required = false) RetryTaskRequest request) {
-        return taskService.retry(agentTaskId, request == null ? null : request.reason());
+                           @Valid @RequestBody(required = false) RetryTaskRequest request,
+                           @RequestAttribute(CallerIdentity.ATTRIBUTE) CallerIdentity caller) {
+        // 先判租户再动作。任务的 tenant_id 建好之后不再变, 所以"读一次再改"
+        // 不存在租户被并发改掉的窗口; 这里和图省事无关, 是事实如此。
+        AgentTask task = taskService.requireTask(agentTaskId);
+        caller.requireTaskVisible(agentTaskId, task.getTenantId());
+        // actor 是"谁发起了这次重试" —— 以前没有身份信息, 只能记任务归属人;
+        // 现在有认证了, 就记真正的人, 不是他操作的那个任务的主人。
+        return taskService.retry(agentTaskId,
+                request == null ? null : request.reason(),
+                TaskEventSource.JAVA_GATEWAY,
+                caller.userId());
     }
 
     /**
@@ -145,8 +173,13 @@ public class TaskController {
      */
     @PostMapping("/{agentTaskId}/cancel")
     public CancelTaskResponse cancel(@PathVariable String agentTaskId,
-                                     @Valid @RequestBody(required = false) CancelTaskRequest request) {
-        return cancellationService.cancel(agentTaskId, request == null ? null : request.reason());
+                                     @Valid @RequestBody(required = false) CancelTaskRequest request,
+                                     @RequestAttribute(CallerIdentity.ATTRIBUTE) CallerIdentity caller) {
+        AgentTask task = taskService.requireTask(agentTaskId);
+        caller.requireTaskVisible(agentTaskId, task.getTenantId());
+        return cancellationService.cancel(agentTaskId,
+                request == null ? null : request.reason(),
+                caller.userId());
     }
 
     /**

@@ -71,6 +71,12 @@
           版本选 5.3.x 是同 broker (5.3.1) 保持同一条发布线。
         -->
         <rocketmq.version>5.3.4</rocketmq.version>
+
+        <!--
+          熔断只引 core, 不引 Spring starter (理由见 km-mcp-server/pom.xml 里
+          那段注释)。2.x 需要 Java 17+, 本项目是 21。
+        -->
+        <resilience4j.version>2.3.0</resilience4j.version>
     </properties>
 
     <dependencyManagement>

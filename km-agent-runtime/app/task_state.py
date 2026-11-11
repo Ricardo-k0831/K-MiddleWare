@@ -37,6 +37,8 @@ from typing import Any
 import httpx
 from langchain_core.callbacks import AsyncCallbackHandler
 
+from app.control_auth import control_auth_headers
+
 logger = logging.getLogger(__name__)
 
 # 与 Java 侧枚举 / MySQL agent_task.status 字段一一对应。
@@ -67,6 +69,7 @@ class TaskStateReporter:
         *,
         trace_id: str,
         timeout: float = 2.0,
+        api_key: str = "",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # ★ trace_id 是【必填的 keyword-only 参数】, 不给缺省值 ★
@@ -82,6 +85,9 @@ class TaskStateReporter:
         self._task_id = task_id
         self._trace_id = trace_id
         self._timeout = timeout
+        # 控制面的服务身份。空 = 不带 (Java 关闭认证时才成立);
+        # 头名和取值规则见 app/control_auth.py。
+        self._headers = control_auth_headers(api_key)
         # 允许注入 client, 测试时可以塞 MockTransport 进来, 不用起真服务
         self._client = client
         self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
@@ -172,6 +178,7 @@ class TaskStateReporter:
     ) -> None:
         response = await client.patch(
             f"{self._base_url}/api/tasks/{self._task_id}/status",
+            headers=self._headers,
             json={
                 # ★ traceId 每次上报都带 ★
                 # Java 用它找到 agent_task_attempt 里对应的那次执行,

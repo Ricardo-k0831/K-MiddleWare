@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.audit import AuditCallbackHandler, AuditReporter
+from app.control_auth import control_auth_headers
 from app.checkpoint import (
     BACKEND_POSTGRES,
     MODE_BUSY,
@@ -510,7 +511,10 @@ async def _verify_task_identity(
         timeout=settings.km_task_service_timeout_seconds
     )
     try:
-        response = await client.get(url)
+        # 控制面入口校验也要带服务身份 —— 它和状态上报是同一套认证。
+        response = await client.get(
+            url, headers=control_auth_headers(settings.km_task_service_api_key)
+        )
     except httpx.HTTPError as ex:
         raise HTTPException(
             status_code=502,
@@ -640,6 +644,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 # 缺了它整条上报会被拒 —— 上面入口已经确保了它非空。
                 trace_id=trace_id,
                 timeout=settings.km_task_service_timeout_seconds,
+                # SERVICE 身份: 状态上报接口只认它 (用户密钥会被 403)。
+                api_key=settings.km_task_service_api_key,
             )
             await reporter.start()
             # 入口就报 THINKING: 这样即使 LLM 一次都没调起来 (直接抛错),
@@ -681,6 +687,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 trace_id=trace_id,
                 interval=settings.heartbeat_interval_seconds,
                 timeout=settings.km_task_service_timeout_seconds,
+                api_key=settings.km_task_service_api_key,
             )
             await beater.start()
 

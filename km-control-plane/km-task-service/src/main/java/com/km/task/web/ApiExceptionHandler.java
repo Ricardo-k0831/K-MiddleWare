@@ -2,6 +2,7 @@ package com.km.task.web;
 
 import com.km.task.error.CancellationNotAllowedException;
 import com.km.task.error.ExecutionMismatchException;
+import com.km.task.error.ForbiddenException;
 import com.km.task.error.IllegalTaskTransitionException;
 import com.km.task.error.MaxRetryExceededException;
 import com.km.task.error.RetryNotAllowedException;
@@ -107,6 +108,20 @@ public class ApiExceptionHandler {
         log.info("重试次数用尽: {}", ex.getMessage());
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(new ApiError("MAX_RETRY_EXCEEDED", ex.getMessage()));
+    }
+
+    /**
+     * 越权 (目前只有"给别的租户建任务")。
+     *
+     * <p>403 而不是 404: 请求体里的租户是调用方自己写的内容, 不存在
+     * "猜到了别人租户名"这回事 —— 回 404 只会让人以为是任务 ID 错了。
+     * 任务级的跨租户读写另走 404, 见 {@code CallerIdentity}。
+     */
+    @ExceptionHandler(ForbiddenException.class)
+    public ResponseEntity<ApiError> handleForbidden(ForbiddenException ex) {
+        log.warn("越权请求被拒: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(new ApiError("FORBIDDEN", ex.getMessage()));
     }
 
     /** @Valid 校验不过 —— 缺字段、超长、负数等 */

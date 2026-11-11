@@ -84,13 +84,15 @@ class RetrySchedulerTest {
         AgentTask opened = openedTask("trace-new");
         when(taskMapper.selectList(any())).thenReturn(List.of(candidate));
         when(taskService.retry(TASK_ID, RetryScheduler.AUTO_RETRY_REASON,
-                TaskEventSource.SYSTEM_RETRY)).thenReturn(opened);
+                TaskEventSource.SYSTEM_RETRY, "system")).thenReturn(opened);
 
         scheduler.sweep();
 
-        // ★ 自动重试必须用 SYSTEM_RETRY ★ 否则审计里分不清"人点的"和"系统救的"
+        // ★ 自动重试必须用 SYSTEM_RETRY ★ 否则审计里分不清"人点的"和"系统救的"。
+        // actor 必须是 "system" 而不是 null —— null 会退回任务归属人,
+        // 审计里看起来像是用户自己点的重试。
         verify(taskService).retry(TASK_ID, RetryScheduler.AUTO_RETRY_REASON,
-                TaskEventSource.SYSTEM_RETRY);
+                TaskEventSource.SYSTEM_RETRY, "system");
         // 派发的是 retry() 返回的对象 —— 它带着新 trace
         verify(dispatcher).dispatch(opened);
     }
@@ -103,13 +105,13 @@ class RetrySchedulerTest {
         AgentTask due = failedTask("task-due", 1, 5,
                 LocalDateTime.now().minusSeconds(61));
         when(taskMapper.selectList(any())).thenReturn(List.of(notDue, due));
-        when(taskService.retry(eq("task-due"), anyString(), any())).thenReturn(
+        when(taskService.retry(eq("task-due"), anyString(), any(), anyString())).thenReturn(
                 openedTask("trace-due"));
 
         scheduler.sweep();
 
-        verify(taskService, never()).retry(eq("task-not-due"), anyString(), any());
-        verify(taskService).retry(eq("task-due"), anyString(), any());
+        verify(taskService, never()).retry(eq("task-not-due"), anyString(), any(), anyString());
+        verify(taskService).retry(eq("task-due"), anyString(), any(), anyString());
         verify(dispatcher).dispatch(any());
     }
 
@@ -119,10 +121,10 @@ class RetrySchedulerTest {
         AgentTask second = failedTask("task-2", 0, 3, LocalDateTime.now().minusSeconds(120));
         when(taskMapper.selectList(any())).thenReturn(List.of(first, second));
         // 第一条在"查到"和"重试"之间被人工抢先了
-        when(taskService.retry(eq("task-1"), anyString(), any()))
+        when(taskService.retry(eq("task-1"), anyString(), any(), anyString()))
                 .thenThrow(new RetryNotAllowedException("task-1", "并发冲突"));
         AgentTask opened = openedTask("trace-2");
-        when(taskService.retry(eq("task-2"), anyString(), any())).thenReturn(opened);
+        when(taskService.retry(eq("task-2"), anyString(), any(), anyString())).thenReturn(opened);
 
         assertDoesNotThrow(() -> scheduler.sweep());
 

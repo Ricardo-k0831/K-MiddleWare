@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     km_task_service_url: str = "http://localhost:8083"
     # 回调是旁路, 宁可丢弃也不要拖慢 Agent 主流程 —— 所以超时给得短。
     km_task_service_timeout_seconds: float = 2.0
+    # 控制面的服务身份 (请求头 X-KM-Api-Key)。
+    #
+    # Python 运行时是 SERVICE 角色: 状态上报和心跳只允许服务身份调用,
+    # 用户密钥碰不了这两个接口。租户通配 —— 它替所有租户执行任务。
+    # 默认值和 Java 侧 km.control-auth.keys 里的 SERVICE 密钥一致;
+    # 生产两边用同一个环境变量 (KM_CONTROL_SERVICE_KEY) 覆盖。
+    km_task_service_api_key: str = "dev-service-key-change-me"
     # 执行期间给 Java 发心跳的间隔。Java 侧 km.heartbeat.stale-after-seconds
     # 必须远大于它 (默认 120s vs 15s) —— 丢一两个心跳不该触发探活。
     #

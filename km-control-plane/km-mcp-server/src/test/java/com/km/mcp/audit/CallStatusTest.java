@@ -2,6 +2,8 @@ package com.km.mcp.audit;
 
 import com.km.audit.AuditEvent;
 import com.km.mcp.client.OrderServiceClient.OrderServiceException;
+import com.km.mcp.guard.BackendUnavailableException;
+import com.km.mcp.guard.ToolRateLimitedException;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -13,6 +15,8 @@ import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link CallStatus} 的判定规则 —— 这些规则决定了审计表里的 status 一列怎么写。
@@ -74,6 +78,43 @@ class CallStatusTest {
         assertEquals(AuditEvent.TIMEOUT,
                 CallStatus.of(new OrderServiceException("调用存量服务失败",
                         new ResourceAccessException("I/O error", new SocketTimeoutException("timeout")))));
+    }
+
+    @Test
+    void 被限流挡掉记DEGRADED_不是ERROR() {
+        // 这不是后端坏了, 是保护机制在工作。记成 ERROR 会让限流告警
+        // 掩盖真正的后端故障 —— 两个数字混在一起就没法用了。
+        assertEquals(AuditEvent.DEGRADED,
+                CallStatus.of(new ToolRateLimitedException("太频繁", "task")));
+    }
+
+    @Test
+    void 熔断打开时没发出去的调用记DEGRADED() {
+        assertEquals(AuditEvent.DEGRADED,
+                CallStatus.of(new BackendUnavailableException("熔断中",
+                        new IllegalStateException("circuit open"))));
+    }
+
+    @Test
+    void 降级判断先于根因判断() {
+        // 限流/熔断异常的 cause 里可能挂着别的异常 (BackendUnavailableException
+        // 挂着 CallNotPermittedException), 但它们不是后端故障。如果先走
+        // rootCause, 就会被认成 ERROR, 而熔断器又会把这个 ERROR 当成
+        // "又一次失败" —— 越熔越开, 正确性被自我强化成一个死循环。
+        assertEquals(AuditEvent.DEGRADED,
+                CallStatus.of(new BackendUnavailableException("熔断中", notFound())));
+    }
+
+    @Test
+    void 只有后端故障才计入熔断失败率() {
+        // 和 of() 共用同一套规则: 4xx 既不是 ERROR 也不能让熔断器开闸。
+        assertFalse(CallStatus.isBackendFailure(null));
+        assertFalse(CallStatus.isBackendFailure(notFound()));
+        assertTrue(CallStatus.isBackendFailure(HttpServerErrorException.create(
+                HttpStatus.INTERNAL_SERVER_ERROR, "boom", HttpHeaders.EMPTY, null, null)));
+        assertTrue(CallStatus.isBackendFailure(
+                new ResourceAccessException("I/O error", new SocketTimeoutException("timeout"))));
+        assertFalse(CallStatus.isBackendFailure(new ToolRateLimitedException("太频繁", "tool")));
     }
 
     @Test

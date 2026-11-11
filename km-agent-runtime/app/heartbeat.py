@@ -46,6 +46,8 @@ import time
 
 import httpx
 
+from app.control_auth import control_auth_headers
+
 logger = logging.getLogger(__name__)
 
 
@@ -117,6 +119,7 @@ class HeartbeatBeater:
         trace_id: str,
         interval: float = 15.0,
         timeout: float = 2.0,
+        api_key: str = "",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not trace_id:
@@ -127,6 +130,8 @@ class HeartbeatBeater:
         # 间隔下限保护: 配置成 0 会把 Java 打成每秒几十次请求。
         self._interval = max(1.0, float(interval))
         self._timeout = timeout
+        # 控制面的服务身份 —— 心跳是 SERVICE 角色专属接口, 用户密钥会被 403。
+        self._headers = control_auth_headers(api_key)
         self._client = client
         self._worker: asyncio.Task[None] | None = None
         self._stopped = False
@@ -188,6 +193,7 @@ class HeartbeatBeater:
         try:
             response = await client.post(
                 f"{self._base_url}/api/tasks/{self._task_id}/heartbeat",
+                headers=self._headers,
                 json={"traceId": self._trace_id},
             )
         except Exception as ex:  # noqa: BLE001 — 旁路, 盲捕是刻意的

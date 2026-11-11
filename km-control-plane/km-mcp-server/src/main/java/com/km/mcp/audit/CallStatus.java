@@ -1,6 +1,7 @@
 package com.km.mcp.audit;
 
 import com.km.audit.AuditEvent;
+import com.km.mcp.guard.DegradedCallException;
 import org.springframework.web.client.HttpClientErrorException;
 
 import java.net.SocketTimeoutException;
@@ -32,6 +33,13 @@ import java.util.concurrent.TimeoutException;
  * <p>429 是唯一的例外: Too Many Requests 说明系统在<b>限流</b>, 那是
  * 容量问题, 必须算 ERROR。
  *
+ * <h3>DEGRADED: 调用被主动挡住, 根本没打后端</h3>
+ *
+ * <p>网关自己的限流和熔断会让一部分调用<b>不发出</b>。这类结果记 DEGRADED
+ * 而不是 ERROR: 保护机制正在按预期工作, 后端可能还活着 (只是太忙)。
+ * 如果和真正的后端故障混成一个 status, 限流告警会把后端故障掩盖掉。
+ * 判断依据是 {@link DegradedCallException} 这个父类, 见它的类注释。
+ *
  * <h3>为什么认的是"根因"而不是直接被抛出的异常</h3>
  *
  * {@code OrderServiceClient} 会把所有异常包成自己的 {@code OrderServiceException},
@@ -49,11 +57,19 @@ public final class CallStatus {
 
     /**
      * @param failure 调用抛出的异常; <b>null 表示成功</b>
-     * @return {@link AuditEvent#OK} / {@link AuditEvent#TIMEOUT} / {@link AuditEvent#ERROR}
+     * @return {@link AuditEvent#OK} / {@link AuditEvent#TIMEOUT} /
+     *         {@link AuditEvent#ERROR} / {@link AuditEvent#DEGRADED}
      */
+     // 根据异常返回调用状态
     public static String of(Throwable failure) {
         if (failure == null) {
             return AuditEvent.OK;
+        }
+
+        // 先判降级: 这类异常由网关自己抛出, 没有 HTTP cause, 走到
+        // rootCause 只会拿到它自己, 结果和"后端故障"无法区分。
+        if (failure instanceof DegradedCallException) {
+            return AuditEvent.DEGRADED;
         }
 
         Throwable cause = rootCause(failure);
@@ -70,6 +86,27 @@ public final class CallStatus {
         }
 
         return AuditEvent.ERROR;
+    }
+
+    /**
+     * 这次失败该不该计入<b>熔断器</b>的失败率。
+     *
+     * <p>和 {@link #of} 共用同一套判断 (4xx 不算失败), 只是返回值不同:
+     * 审计要区分 OK/ERROR/TIMEOUT/DEGRADED 四种, 熔断器只关心
+     * "算不算后端故障"这一个布尔值。
+     *
+     * <p>两个判断放在同一个类里不是巧合: 它们一旦分家, 就会出现
+     * "审计里显示后端一片 ERROR, 熔断器却认为天下太平"这种自相矛盾的状态,
+     * 而排查时你会同时相信这两个数字。
+     *
+     * @param failure 调用抛出的异常; null (成功) 不算失败
+     * @return true 表示这是后端侧的故障, 应当计入失败率
+     */
+    // 利用AuditEvent判断是否是后端故障
+    public static boolean isBackendFailure(Throwable failure) {
+        String status = of(failure);
+        // 429 , TIMEOUT 和 ERROR 是后端故障; OK (含 4xx) 与 DEGRADED 不是。
+        return AuditEvent.ERROR.equals(status) || AuditEvent.TIMEOUT.equals(status);
     }
 
     /**

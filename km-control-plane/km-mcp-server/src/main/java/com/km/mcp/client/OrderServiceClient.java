@@ -6,6 +6,7 @@ import com.km.audit.AuditLayer;
 import com.km.audit.AuditPublisher;
 import com.km.mcp.audit.CallStatus;
 import com.km.mcp.audit.TaskIdentity;
+import com.km.mcp.guard.BackendCircuitBreaker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -56,12 +57,25 @@ public class OrderServiceClient {
     private final RestClient restClient;
     private final AuditPublisher audit;
 
+    /**
+     * 熔断器。包在<b>整次 {@link #call} 外面</b>, 不是包在 {@code httpCall} 上。
+     *
+     * <p>位置是有讲究的: 包在外面, 熔断打开时 {@code call} 根本不会执行,
+     * 于是<b>不会</b>投递 LEGACY_SERVICE 审计 —— 那是正确的, 因为存量服务
+     * 并没有被调用。包在里面的话, 每次被熔断拒绝都会留下一条"调用了存量
+     * 服务并且失败"的记录, 审计里会多出大量根本没发生过的调用,
+     * 按层统计调用量直接失真。
+     */
+    private final BackendCircuitBreaker circuitBreaker;
+
     public OrderServiceClient(
             RestClient.Builder builder,
             @Value("${km.backend.order-service.base-url}") String baseUrl,
-            AuditPublisher audit) {
+            AuditPublisher audit,
+            BackendCircuitBreaker circuitBreaker) {
         this.restClient = builder.baseUrl(baseUrl).build();
         this.audit = audit;
+        this.circuitBreaker = circuitBreaker;
     }
 
     /**
@@ -79,11 +93,12 @@ public class OrderServiceClient {
         // 审计里记的是【真实发出的路径】, 不是 /api/orders/{orderId} 这种模板 ——
         // 模板查不出"到底查了哪个订单号", 而那恰恰是排查时要看的。
         String endpoint = "GET /api/orders/" + orderId;
-        return call(identity, endpoint, Map.of("orderId", orderId),
+        // 熔断在最外层: 打开时这次调用连 call() 都不会进 (见字段注释)
+        return circuitBreaker.call(() -> call(identity, endpoint, Map.of("orderId", orderId),
                 () -> restClient.get()
                         .uri("/api/orders/{orderId}", orderId)
                         .retrieve()
-                        .body(Map.class));
+                        .body(Map.class)));
     }
 
     /**
@@ -92,13 +107,13 @@ public class OrderServiceClient {
     @SuppressWarnings("unchecked")
     public List<Map<String, Object>> listOrdersByUser(String userId, TaskIdentity identity) {
         String endpoint = "GET /api/orders?userId=" + userId;
-        return call(identity, endpoint, Map.of("userId", userId),
+        return circuitBreaker.call(() -> call(identity, endpoint, Map.of("userId", userId),
                 () -> restClient.get()
                         .uri(uriBuilder -> uriBuilder.path("/api/orders")
                                 .queryParam("userId", userId)
                                 .build())
                         .retrieve()
-                        .body(List.class));
+                        .body(List.class)));
     }
 
     /**

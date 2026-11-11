@@ -6,6 +6,17 @@ spring:
   application:
     name: km-mcp-server
 
+  # 限流计数器的存储。见 km.gateway.rate-limit —— 计数器必须跨实例共享,
+  # 放在 JVM 内存里的话, N 个网关实例 = 实际放行 N 倍流量。
+  # 开发环境用 docker compose 里的 km-redis (:6379, 无密码)。
+  data:
+    redis:
+      host: ${KM_REDIS_HOST:localhost}
+      port: ${KM_REDIS_PORT:6379}
+      # 连接超时要短: Redis 挂了应当尽快 fail-open, 不能把工具调用拖住。
+      timeout: 500ms
+      connect-timeout: 500ms
+
   ai:
     mcp:
       server:
@@ -44,6 +55,32 @@ km:
   backend:
     order-service:
       base-url: http://localhost:8082
+
+  # ---------------- 网关的两道保护: 限流 + 熔断 ----------------
+  # 设计说明见 GatewayGuardProperties / ToolRateLimiter / BackendCircuitBreaker
+  # 的类注释。这里只放数值, 两者的取舍都写在代码里。
+  gateway:
+    rate-limit:
+      # 默认开。Redis 不可用时是 fail-open (放行), 限流器不会变成新的单点。
+      enabled: ${KM_GATEWAY_RATE_LIMIT_ENABLED:true}
+      # 工具维度: 保护后端总容量。5/s 稳态, 允许 10 次突发。
+      per-tool-refill-per-second: 5.0
+      per-tool-burst: 10
+      # 任务维度: 防止单个失控任务吃光共享配额。2/s 稳态, 允许 5 次突发。
+      per-task-refill-per-second: 2.0
+      per-task-burst: 5
+      key-prefix: km:gateway:rl
+
+    circuit-breaker:
+      # 默认开。后端持续故障时, 熔断是防止网关自己被拖垮的唯一手段。
+      enabled: ${KM_GATEWAY_CIRCUIT_BREAKER_ENABLED:true}
+      # 最近 30 秒内失败率 >= 50% 且至少 5 次调用 -> 打开
+      failure-rate-threshold: 50.0
+      sliding-window-size-seconds: 30
+      minimum-number-of-calls: 5
+      # 打开 10 秒后放 2 个试探请求 (半开); 全成功才关闭
+      wait-duration-in-open-state-seconds: 10
+      permitted-number-of-calls-in-half-open-state: 2
 
   # 审计投递。装配代码在 km-audit-core 的 AuditAutoConfiguration 里,
   # 网关这边只有这一份配置 + McpGatewayAuditConfig 里的那个 contextExtractor。

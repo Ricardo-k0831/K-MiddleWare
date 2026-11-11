@@ -236,12 +236,18 @@ def wired(monkeypatch):
 
     class RecordingReporter(TaskStateReporter):
         def __init__(
-            self, base_url: str, task_id: str, *, trace_id: str, timeout: float = 2.0
+            self, base_url: str, task_id: str, *, trace_id: str,
+            timeout: float = 2.0, api_key: str = "",
         ) -> None:
             super().__init__(
                 base_url, task_id, trace_id=trace_id, timeout=timeout,
+                api_key=api_key,
                 client=httpx.AsyncClient(transport=fake.transport()),
             )
+            # ★ 记下 /chat 传进来的密钥 ★
+            # 假 Java 不看头 (它只验报文), 所以"到底带没带 X-KM-Api-Key"
+            # 必须由这里显式记一笔, 否则漏了鉴权头四个测试文件全是绿的。
+            self.seen_api_key = api_key
             self.aclosed = False
             created.append(self)
 
@@ -287,12 +293,14 @@ def wired(monkeypatch):
 
         def __init__(
             self, base_url: str, task_id: str, *, trace_id: str,
-            interval: float = 15.0, timeout: float = 2.0,
+            interval: float = 15.0, timeout: float = 2.0, api_key: str = "",
         ) -> None:
             super().__init__(
                 base_url, task_id, trace_id=trace_id, interval=interval,
-                timeout=timeout, client=httpx.AsyncClient(transport=fake.transport()),
+                timeout=timeout, api_key=api_key,
+                client=httpx.AsyncClient(transport=fake.transport()),
             )
+            self.seen_api_key = api_key
             self.aclosed = False
             fake.beaters.append(self)
 
@@ -390,6 +398,26 @@ def test_带task_id时上报进行中状态与终态(wired):
     # 这不是重复 bug —— Java 侧对同态上报是幂等的, 不会写重复事件行。
     # 入口那一条的意义是: 即使 LLM 一次都没跑起来, 事件表里也有"开始过"的痕迹。
     assert fake.statuses() == [THINKING, THINKING, TOOL_CALLING, COMPLETED]
+
+
+def test_任务链路的上报和心跳都带SERVICE密钥(wired):
+    """控制面鉴权 (2026-11-09) —— /chat 必须把 SERVICE 密钥交给两条旁路。
+
+    空字符串不是"少一个头"这么简单: Java 会直接 401, 于是状态永远停在
+    THINKING、心跳一条都发不出去, 而 Python 这边只会看到"上报失败"的
+    warning。默认值本身不能为空, 否则等于鉴权默认把运行时锁在门外。
+    """
+    from app.config import get_settings
+
+    fake, created = wired
+    post_chat(FakeAgent(), {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    expected = get_settings().km_task_service_api_key
+    assert expected, "默认服务密钥是空串 —— 等于不带 X-KM-Api-Key, 所有上报都会被 401"
+    assert created, "没建 Reporter"
+    assert created[0].seen_api_key == expected, "状态上报没带 SERVICE 密钥"
+    assert fake.beaters, "没建心跳"
+    assert fake.beaters[0].seen_api_key == expected, "心跳没带 SERVICE 密钥"
 
 
 def test_终态detail里带着最终答复(wired):
@@ -529,10 +557,12 @@ def test_Java拒绝上报时请求仍然成功(wired, monkeypatch):
     #   会打到 RecordingReporter 的签名上, 报 TypeError。这个坑踩过一次。
     class Rejecting(TaskStateReporter):
         def __init__(
-            self, base_url: str, task_id: str, *, trace_id: str, timeout: float = 2.0
+            self, base_url: str, task_id: str, *, trace_id: str,
+            timeout: float = 2.0, api_key: str = "",
         ) -> None:
             super().__init__(
                 base_url, task_id, trace_id=trace_id, timeout=timeout,
+                api_key=api_key,
                 client=httpx.AsyncClient(transport=httpx.MockTransport(always_409)),
             )
 

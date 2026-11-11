@@ -365,6 +365,44 @@ Agent 那边没有，说明有别的东西在发 tools/call。
 判定规则集中在 `CallStatus` 里，而不是散落在各个 catch 块——分散了的话，同一件事
 在不同地方会被记成不同的 status，按 status 做的统计就全部不可信。
 
+### DEGRADED 记"没打后端就被挡住了"（2026-11-09）
+
+`status` 的第四个值。网关自己的**限流**和**熔断**会让一部分调用**不发出**：
+
+- 限流拒绝：令牌桶没令牌，请求连后端都没碰
+- 熔断打开：后端已连续失败，后续调用被快速拒绝，同样没有发出
+
+这两类记 `DEGRADED` 而不是 `ERROR`。区别在于语义：`ERROR` 是"调用了，而且
+坏了"——它应该拉警报；`DEGRADED` 是"调用被主动降级，保护机制按预期在工作"
+——后端可能还活着，只是太忙。混成一个值的话，限流告警会把真正的后端故障
+掩盖掉，而排查时你会同时相信这两个数字。
+
+判断依据是一个共同的父类 `DegradedCallException`：限流和熔断各是它的子类。
+这样 `CallStatus` 只需要一次 `instanceof`，以后再加"没打后端就失败"的情况
+（比如权限不足）自动获得同样的语义，不用回来改两处。
+
+熔断器的**失败率只统计后端故障**（`CallStatus.isBackendFailure`，与 `of()` 共用
+同一套 4xx 规则）。这一点很关键：如果 4xx 也计入，一批"用户输错订单号"的流量
+就能把熔断打开，然后正常查询被拒绝——熔断器被正常业务触发，这是最糟糕的误伤。
+
+实测（2026-11-09，`scripts/verify_gateway_guard.py`）：
+
+```
+# 限流: 同一任务并发 12 次 (任务桶 burst=5 补 2/s, 工具桶 burst=10 补 5/s)
+放行并返回真实订单: 5 次     被限流: 7 次
+审计: MCP_GATEWAY OK ×5 / DEGRADED ×7;  LEGACY_SERVICE OK ×5（被挡的没有这一层）
+
+# 熔断: 停掉 8082 后每 600ms 调一次
+前 5 次: LEGACY_SERVICE ERROR ×5 + MCP_GATEWAY ERROR ×5
+第 6 次起: MCP_GATEWAY DEGRADED ×5（LEGACY_SERVICE 一行都没有 —— 请求没发出）
+网关恢复后: 半开试探 1 次成功 -> 熔断器自动关闭, 不需要重启网关
+```
+
+**为什么限流检查放在 `audit.invoke` 的 body 里**，而不是放在工具方法外面：
+放在外面的话，被限流的调用不会产生审计——而"哪个任务在刷、刷了多少次"恰恰是
+排查限流问题时最需要的数据。放在里面，拒绝会走 `onFailure`，自然落一条
+DEGRADED 审计。
+
 ### 顺带修掉的一个谎话
 
 改之前，`get_order_by_id` 无论后端是"明确回了 404"还是"根本连不上"，给 Agent 的
@@ -376,6 +414,11 @@ Agent 那边没有，说明有别的东西在发 tools/call。
 现在按同一个 `CallStatus` 分支：404 说"没有找到"，其它说"后端服务异常，这不能
 说明该订单不存在"。**判断依据是同一个方法，所以"审计里记的"和"Agent 看到的"
 永远一致**——不会出现审计说是故障、用户被告知"订单不存在"这种对不上的情况。
+
+2026-11-09 加了第三种：被限流/熔断挡掉时，话术必须显式说**"本次调用没有被执行"**，
+并明确要求 Agent **不要立即重试**。前者是因为用户分不清"我的订单查不到"和
+"系统太忙"；后者是因为 LLM 看到失败时的本能就是重试，而限流/熔断期间重试只会
+让情况更糟（令牌还没补充 / 熔断还在打开）。告诉它别重试，比事后调参数有效。
 
 ---
 
@@ -736,29 +779,41 @@ TOOL_CALLING → THINKING             source=PYTHON_RUNTIME  detail.phase=llm
 THINKING     → COMPLETED            source=PYTHON_RUNTIME  detail.result=...
 ```
 
-### 6. 单元测试（今天的量）
+### 6. 单元测试（当前量，2026-11-09）
 
 ```bash
 cd km-control-plane && mvn install
+# —— 合计 196 (Java) ——
 # km-audit-core        AuditPublisherTest                 12
-# km-mcp-server        TaskIdentityTest                     6
-#                      CallStatusTest                       8
+# km-mcp-server        CallStatusTest                      12   (含 DEGRADED / isBackendFailure)
 #                      McpToolAuditTest                    10
 #                      OrderServiceClientAuditTest          8
-# km-task-service      TaskStatusMachineTest               11   (含重试边)
+#                      TaskIdentityTest                     6
+#                      ToolRateLimiterTest                  8   (任务桶先于工具桶 / fail-open)
+#                      BackendCircuitBreakerTest            5   (4xx 不算失败 / 半开恢复)
+# km-task-service      TaskServiceTest                     25   (执行身份 + 溯源 + 重试两入口)
 #                      AuditIngestServiceTest              24   (映射 + 身份核对矩阵)
+#                      TaskStatusMachineTest               11   (含重试边)
+#                      HeartbeatSweeperTest                11   (僵尸判定)
+#                      AuditControllerTest                 10   (本项目第一个 web 测试)
+#                      ControlAuthFilterTest                8   (401/403/404 + 身份属性)  ← 2026-11-09
+#                      RetrySchedulerTest                   8   (退避 / 批次 / 租户灰度)
 #                      CachedAttemptLookupTest              6   (缓存的三种结果)
+#                      HeartbeatProbeTest                   6   (500ms 截止)
+#                      RetryDispatcherTest                  6   (payload + 失败分类)
 #                      GuardedAttemptLookupTest             5   (500ms 截止 + 熔断)
 #                      AuditIngestAuthFilterTest            5   (认证边界)
-#                      AuditControllerTest                 10   (本项目第一个 web 测试)
-#                      TaskServiceTest                     15   (执行身份 + 溯源 + 重试两入口)
-#                      RetrySchedulerTest                   8   (退避 / 批次 / 租户灰度)
-#                      RetryDispatcherTest                  5   (payload + 失败分类)
+#                      PythonCancelNotifierTest             4
+#                      TaskCancellationServiceTest          3
 #                      ReportStatusRequestTest              3   (traceId 必填契约)
 
 cd km-agent-runtime && uv run pytest
-# 103 passed, 3 skipped   (跳过的是 3 条 MCP 握手用例: 8081 没起)
+# 173 passed   (服务全起时不再跳过 MCP 握手用例)
 ```
+
+> 这个数字维护在**一处**：上一节「单元测试」只写规模，不抄清单 —— 两处各写
+> 一份的下场是两边数字各自漂移，谁也不知道哪个是真的。改动测试时请回来
+> 更新这里（`grep -c '@Test'` 逐类统计 + `pytest -q` 尾行）。
 
 `AuditControllerTest` 是**本项目第一个 web 测试**。它验的不是业务，是
 **跨语言契约的形状**：字段名就是信封上的名字，多一个少一个都不行。因为

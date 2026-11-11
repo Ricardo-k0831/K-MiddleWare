@@ -67,6 +67,34 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!--
+          限流的存储。★ 限流状态必须放在进程外 ★
+          网关的计数器一旦在 JVM 内存里, 多实例部署时每个实例各限各的,
+          实际放行量 = 实例数 × 配置值 —— 配置看起来生效了, 但后端承受的
+          流量是 N 倍。Redis + Lua 让"读-改-写"在一个原子操作里完成。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!--
+          ★ 为什么用 core 而不是 resilience4j-spring-boot3 starter ★
+          starter 是给 Boot 3 写的, 它通过自动配置注册 AOP 切面并读
+          spring-boot3 专用的配置前缀; 本项目是 Boot 4, 版本对不上时
+          最坏的情况是"配置没读进去、切面静默不生效" —— 熔断看着开着,
+          实际一次都没拦。core 模块没有 Spring 依赖, 由我们自己 new
+          一个 CircuitBreaker, 配置绑定也自己写, 行为完全可预期。
+
+          只引 circuitbreaker: 限流用 Redis Lua, 不需要 ratelimiter 模块;
+          重试已经在任务服务 (RetryScheduler) 里有了, 不需要 retry 模块。
+        -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-circuitbreaker</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

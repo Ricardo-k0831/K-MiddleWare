@@ -5,6 +5,9 @@ import com.km.mcp.audit.CallStatus;
 import com.km.mcp.audit.McpToolAudit;
 import com.km.mcp.audit.TaskIdentity;
 import com.km.mcp.client.OrderServiceClient;
+import com.km.mcp.guard.BackendUnavailableException;
+import com.km.mcp.guard.ToolRateLimitedException;
+import com.km.mcp.guard.ToolRateLimiter;
 import io.modelcontextprotocol.common.McpTransportContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -89,10 +92,13 @@ public class OrderMcpTools {
 
     private final OrderServiceClient orderServiceClient;
     private final McpToolAudit audit;
+    private final ToolRateLimiter rateLimiter;
 
-    public OrderMcpTools(OrderServiceClient orderServiceClient, McpToolAudit audit) {
+    public OrderMcpTools(OrderServiceClient orderServiceClient, McpToolAudit audit,
+                         ToolRateLimiter rateLimiter) {
         this.orderServiceClient = orderServiceClient;
         this.audit = audit;
+        this.rateLimiter = rateLimiter;
     }
 
     @McpTool(
@@ -112,8 +118,17 @@ public class OrderMcpTools {
         TaskIdentity identity = TaskIdentity.from(transportContext);
         log.info("[MCP] get_order_by_id orderId={} taskId={}", orderId, identity.taskId());
 
+        // invoke 吞掉异常降级处理为自然信息
         return audit.invoke(identity, "get_order_by_id", Map.of("orderId", orderId),
-                () -> orderServiceClient.getOrderById(orderId, identity),
+                // ★ 限流检查放在 audit.invoke 的 body 里, 不是放在外面 ★
+
+                // 放在外面的话, 被限流的调用不会产生审计
+                // 而"哪个任务在刷、刷了多少次"恰恰是排查限流问题时最需要的数据。
+                // 放在这里, 限流拒绝抛出的异常 会被捕获 + 降级处理 + 审计入库
+                () -> {
+                    rateLimiter.check("get_order_by_id", identity);
+                    return orderServiceClient.getOrderById(orderId, identity);
+                },
                 ex -> orderLookupFailed(orderId, ex));
     }
 
@@ -136,6 +151,7 @@ public class OrderMcpTools {
 
         return audit.invoke(identity, "list_orders_by_user", Map.of("userId", userId),
                 () -> {
+                    rateLimiter.check("list_orders_by_user", identity);
                     List<Map<String, Object>> orders = orderServiceClient.listOrdersByUser(userId, identity);
                     // 必须包成 object, 不能直接返回 List —— 见类注释"返回值必须是 JSON object"
                     return Map.of("count", orders.size(), "orders", orders);
@@ -143,6 +159,10 @@ public class OrderMcpTools {
                 ex -> {
                     // 注意: 这里不能返回空列表。后端挂了和"该用户确实没有订单"是两回事,
                     // 返回空列表会让 Agent 把故障如实转述成"你没有订单", 是在骗用户。
+                    Map<String, Object> degraded = degradedMessage(ex);
+                    if (degraded != null) {
+                        return degraded;
+                    }
                     return Map.of(
                             "error", true,
                             "message", "查询用户 " + userId + " 的订单时后端服务异常, 这不是"
@@ -169,6 +189,12 @@ public class OrderMcpTools {
      * 用户被告知"订单不存在"这种对不上的情况。
      */
     private static Map<String, Object> orderLookupFailed(String orderId, Throwable ex) {
+        // 被限流/熔断挡掉时, 后端<b>根本没有被查询</b> —— 必须先于 404 判断,
+        // 否则会被当成"订单不存在"告诉用户, 那是彻底的谎话。
+        Map<String, Object> degraded = degradedMessage(ex);
+        if (degraded != null) {
+            return degraded;
+        }
         if (AuditEvent.OK.equals(CallStatus.of(ex))) {
             // 后端明确回答"没有", 这是一次成功的查询
             return Map.of(
@@ -183,5 +209,41 @@ public class OrderMcpTools {
                 "message", "查询订单 " + orderId + " 时后端服务异常, 这不能说明该订单不存在。"
                         + "请稍后重试, 或告知用户稍后再查。"
         );
+    }
+
+    /**
+     * 限流 / 熔断的统一话术。不是这两类时返回 null, 由调用方继续判断。
+     *
+     * <p><b>为什么话术要显式说"没有执行"</b>: Agent 拿到错误 Map 后会转述给
+     * 用户。如果只说"查询失败", 用户无法区分"我的订单查不到"和"系统太忙"。
+     * 而这两种情况下, 用户该做的事完全不同 —— 前者该核对订单号, 后者该等一会儿。
+     *
+     * <p><b>为什么明确写"不要立即重试"</b>: LLM 看到失败时的本能是重试。
+     * 限流/熔断状态下立即重试只会让情况更糟 (令牌还没补充 / 熔断还在打开),
+     * 而 Agent 会把这个动作变成一轮更密集的调用。告诉它别重试, 比事后
+     * 调整限流参数有效得多。
+     */
+    private static Map<String, Object> degradedMessage(Throwable ex) {
+        if (ex instanceof ToolRateLimitedException rateLimited) {
+            log.warn("[MCP] 工具调用被限流 scope={}", rateLimited.getScope());
+            return Map.of(
+                    "error", true,
+                    "executed", false,
+                    "message", "本次调用【没有被执行】: 工具调用过于频繁, 已被网关限流。"
+                            + "请不要立即重试 —— 立刻重试只会继续被拒。"
+                            + "请直接告诉用户系统当前繁忙, 稍后再查。"
+            );
+        }
+        if (ex instanceof BackendUnavailableException) {
+            log.warn("[MCP] 熔断打开, 调用未发出: {}", ex.getMessage());
+            return Map.of(
+                    "error", true,
+                    "executed", false,
+                    "message", "本次调用【没有被执行】: 订单服务当前不可用 (连续失败已被熔断)。"
+                            + "请不要立即重试 —— 熔断期间重试不会成功, 也无法查到订单。"
+                            + "请直接告诉用户服务暂时不可用, 稍后再查。"
+            );
+        }
+        return null;
     }
 }

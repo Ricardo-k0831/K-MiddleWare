@@ -20,7 +20,7 @@ Python 做数据面（Agent 编排、推理、RAG），MCP 协议打通两边。
                     │  km-task-service 任务状态事实源             │
                     │    状态机 / 重试 / 心跳 / 取消              │
                     │  km-audit-core   四层审计汇聚               │
-                    │  （权限 / 限流 / 熔断: 规划中）             │
+                    │  （限流 / 熔断已实现, 权限裁剪未做）        │
                     └──────────────┬──────────────────────────────┘
                                    │ 派发: HTTP /chat
                                    │ 审计: RocketMQ → audit_log
@@ -59,7 +59,8 @@ docker compose -f docker/docker-compose.yml up -d
 docker compose -f docker/docker-compose.yml ps   # 等全部 healthy
 ```
 
-拉起：MySQL **3307**（容器内 3306，见下方说明）、Redis 6379、PostgreSQL(pgvector) 5432、RocketMQ 9876/10911。
+拉起：MySQL **3307**（容器内 3306，见下方说明）、Redis 6379（网关限流计数器）、
+PostgreSQL(pgvector) 5432、RocketMQ 9876/10911。
 
 > MySQL 特意映射到宿主机 **3307**：本机若装了原生 MySQL（Windows 服务，默认占 3306），
 > 容器会因抢不到端口直接退出（`Exited (137)`）。容器内部仍是 3306，docker 网络内的服务
@@ -118,8 +119,10 @@ curl -X POST http://localhost:8000/chat \
   -d '{"message":"帮我查一下订单 SO20260901001 的状态","thread_id":"t1"}'
 
 # 任务链路：先建任务，再带着任务身份调 /chat
+# ★ 8083 需要控制面密钥：USER 密钥只能在自己租户（demo）下建任务 ★
 curl -X POST http://localhost:8083/api/tasks \
   -H 'Content-Type: application/json' \
+  -H 'X-KM-Api-Key: dev-user-key-change-me' \
   -d '{"userId":"U1001","sessionId":"s-demo","intent":"查订单","tenantId":"demo","maxRetry":1}'
 # 把响应里的 agentTaskId / traceId / sessionId 原样转交：
 curl -X POST http://localhost:8000/chat \
@@ -128,13 +131,26 @@ curl -X POST http://localhost:8000/chat \
        "task_id":"<agentTaskId>","trace_id":"<traceId>",
        "tenant_id":"demo","actor":"U1001","session_id":"s-demo"}'
 
-# 查最终状态与事件链
-curl http://localhost:8083/api/tasks/<agentTaskId>
-curl http://localhost:8083/api/tasks/<agentTaskId>/events
+# 查最终状态与事件链（同样要带密钥）
+curl -H 'X-KM-Api-Key: dev-user-key-change-me' \
+  http://localhost:8083/api/tasks/<agentTaskId>
+curl -H 'X-KM-Api-Key: dev-user-key-change-me' \
+  http://localhost:8083/api/tasks/<agentTaskId>/events
 ```
 
 `trace_id` 只能来自任务创建（或重试）的响应 —— Python 不生成它。缺了会 400，
 补一个假的则会让同一遍执行在审计里劈成两条对不上的链路。
+
+`X-KM-Api-Key` 有两个开发默认值（生产用 `KM_CONTROL_USER_KEY` /
+`KM_CONTROL_SERVICE_KEY` 覆盖，启动日志会对默认密钥 WARN 一次）：
+
+| 密钥 | 角色 | 能做什么 |
+| --- | --- | --- |
+| `dev-user-key-change-me` | USER（租户 `demo`） | 建任务 / 查 / 取消 / 重试 |
+| `dev-service-key-change-me` | SERVICE（租户通配） | Python 运行时用；上报状态 / 心跳 |
+
+状态上报和心跳**只接受 SERVICE 密钥** —— 否则拿到用户密钥的脚本就能伪造
+`COMPLETED`。详见 [`docs/task-state-machine.md`](docs/task-state-machine.md#控制面鉴权2026-11-09)。
 
 ### 5. 详细文档
 
@@ -196,7 +212,9 @@ Agent 拿到的能力本身就是被限制过的。
 两套规则迟早会不一致，而不一致的那一侧就是漏洞。
 
 > **现状（2026-11-09）**：边界的位置已经定死，**裁剪本身还没实现** ——
-> 网关目前全量暴露工具。这是 Phase 2 的第一项，不是已完成能力。
+> 网关目前全量暴露工具。这是 Phase 2 剩下的第一项，不是已完成能力。
+> 网关上的限流/熔断保护的是**容量**（谁都能调，但调不快），不是**权限**
+> （谁能调什么），两者不要混为一谈。
 
 ### 4. 存量微服务零改造
 
@@ -254,8 +272,15 @@ K_middleware/
 
 ### Phase 2 — 企业特性
 
-- [ ] 网关权限裁剪 / 限流 / 熔断（README 前半部分描述的是**目标态**，尚未实现）
-- [ ] 控制面鉴权（`/api/tasks` 目前无认证，审计的 `actor` 只是任务归属人）
+- [ ] 网关权限裁剪（按租户/角色裁剪工具列表）—— README 前半部分描述的是**目标态**
+- [x] 网关限流 + 熔断 ← ✅ 2026-11-09
+  - Redis 令牌桶（Lua 原子操作），任务 / 工具两个维度，Redis 故障时 fail-open
+  - Resilience4j core 熔断，4xx 不计入失败率；被挡掉的调用记审计 `DEGRADED`
+  - 验收：`km-agent-runtime/scripts/verify_gateway_guard.py`
+- [x] 控制面鉴权 ← ✅ 2026-11-09
+  - `X-KM-Api-Key` → (租户, 操作者, 角色)，USER / SERVICE 两种角色
+  - 跨租户读一律 404（不做存在性泄露）；审计 `actor` 变成真正的调用方
+  - 验收：`km-control-plane/scripts/verify_control_auth.py`
 - [ ] 全链路 OTel 追踪、Token 指标、Micrometer 指标与审计采样率策略
 - [ ] Prompt 注入防护
 - [ ] SSE 流式输出

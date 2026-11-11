@@ -63,7 +63,14 @@ def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
         BASE + path,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json; charset=utf-8"},
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            # 控制面认证: 验收脚本是"运维/服务"调用方, 用 SERVICE 密钥
+            # (租户通配, 也能上报状态)。值必须和 Java 的 KM_CONTROL_SERVICE_KEY 一致。
+            "X-KM-Api-Key": os.environ.get(
+                "KM_CONTROL_SERVICE_KEY", "dev-service-key-change-me"
+            ),
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:

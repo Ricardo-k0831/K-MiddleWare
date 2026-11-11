@@ -345,7 +345,7 @@ public class TaskService {
      */
     @Transactional
     public AgentTask retry(String agentTaskId, String reason) {
-        return doRetry(agentTaskId, reason, TaskEventSource.JAVA_GATEWAY);
+        return doRetry(agentTaskId, reason, TaskEventSource.JAVA_GATEWAY, null);
     }
 
     /**
@@ -356,10 +356,25 @@ public class TaskService {
      */
     @Transactional
     public AgentTask retry(String agentTaskId, String reason, TaskEventSource source) {
-        return doRetry(agentTaskId, reason, source);
+        return doRetry(agentTaskId, reason, source, null);
     }
 
-    private AgentTask doRetry(String agentTaskId, String reason, TaskEventSource source) {
+    /**
+     * 带操作者身份的重试入口 —— 控制面认证通过后由 Controller 传进来。
+     *
+     * <p>source 和 actor 是两件事: source 回答"哪条路径发起的"
+     * (人工 / 自动调度), actor 回答"谁"。自动重试没有"人", 传
+     * {@code "system"}; 手工入口传认证出来的操作者。
+     * 两者都只影响审计, 不改变任何校验。
+     */
+    @Transactional
+    public AgentTask retry(String agentTaskId, String reason,
+                           TaskEventSource source, String actor) {
+        return doRetry(agentTaskId, reason, source, actor);
+    }
+
+    private AgentTask doRetry(String agentTaskId, String reason,
+                              TaskEventSource source, String actor) {
         AgentTask task = requireTask(agentTaskId);
         TaskStatus from = parseStatus(task);
 
@@ -458,9 +473,9 @@ public class TaskService {
                 .tenantId(updated.getTenantId())
                 .layer(AuditLayer.TASK_SERVICE)
                 .eventType(AuditEventType.TASK_LIFECYCLE)
-                // actor 仍是任务归属用户: 重试的是"他的任务"。
-                // 发起者在当前的接口里没有身份信息 (还没有鉴权), 不编造。
-                .actor(updated.getUserId())
+                // 发起者: 控制面认证后是密钥对应的操作者; 内部调用
+                // (自动调度 / 旧脚本) 传 null, 退回任务归属用户。
+                .actor(actor != null ? actor : updated.getUserId())
                 .status(AuditEvent.OK)
                 .requestBody(transitionRequest(from, TaskStatus.PENDING, source, detail))
                 .responseBody(taskSnapshot(updated))
@@ -511,9 +526,19 @@ public class TaskService {
      * @return 更新后的任务 (状态 CANCELLED)
      */
     @Transactional
-    public AgentTask
+    public AgentTask cancel(String agentTaskId, String reason) {
+        return cancel(agentTaskId, reason, null);
+    }
 
-    cancel(String agentTaskId, String reason) {
+    /**
+     * 带操作者身份的取消入口 —— 控制面认证通过后由 Controller 传进来。
+     *
+     * <p>{@code actor} 只影响审计里的"谁发起", 不参与任何状态判断:
+     * 能不能取消仍然由状态机决定, 身份不能变成绕过边界的后门。
+     * 为 null 时退回任务归属用户 (内部调用 / 旧脚本), 保持原有行为。
+     */
+    @Transactional
+    public AgentTask cancel(String agentTaskId, String reason, String actor) {
         AgentTask task = requireTask(agentTaskId);
         TaskStatus from = parseStatus(task);
 
@@ -590,9 +615,10 @@ public class TaskService {
                 .tenantId(updated.getTenantId())
                 .layer(AuditLayer.TASK_SERVICE)
                 .eventType(AuditEventType.TASK_LIFECYCLE)
-                // 和重试一致: actor 是任务归属用户; "谁发起的"在 source 里
-                // (JAVA_GATEWAY = 人工/调用方显式发起)。
-                .actor(updated.getUserId())
+                // 谁发起就记谁: 控制面认证通过后 actor 是密钥对应的操作者;
+                // 内部调用没有身份 (actor=null) 时退回任务归属用户 ——
+                // 不编造一个"系统", 那样连"这条是老代码发的"都看不出来。
+                .actor(actor != null ? actor : updated.getUserId())
                 .status(AuditEvent.OK)
                 .requestBody(transitionRequest(from, TaskStatus.CANCELLED,
                         TaskEventSource.JAVA_GATEWAY, detail))

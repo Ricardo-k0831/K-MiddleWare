@@ -105,8 +105,11 @@ public class RetryScheduler {
                 continue;
             }
             try {
+                // actor 显式写 "system": 自动重试没有"人", 但审计里不能是空 ——
+                // 空会退回任务归属人, 看起来像用户自己点的重试, 误导排查。
                 AgentTask updated = taskService.retry(
-                        task.getAgentTaskId(), AUTO_RETRY_REASON, TaskEventSource.SYSTEM_RETRY);
+                        task.getAgentTaskId(), AUTO_RETRY_REASON,
+                        TaskEventSource.SYSTEM_RETRY, "system");
                 dispatcher.dispatch(updated);
                 retried++;
                 log.info("自动重试 task={} retryCount={}/{} backoff={}s trace={}",
