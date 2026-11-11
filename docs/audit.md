@@ -959,8 +959,12 @@ AUDIT_INGEST_TOKEN=dev-audit-token-change-me
    - **token 是共享的。** 一份泄露 = 所有提交方都能写。要做到"按调用方追责"，
      得给每个提交方发独立凭据，或者上 mTLS——现在只有 Python 一个提交方，
      还为时过早。
-   - **控制面的其它接口仍然没有鉴权。** `/api/tasks` 谁都能建任务、改状态；
-     审计入口只是先收口了这一处。
+   - ~~**控制面的其它接口仍然没有鉴权。**~~ 2026-11-09 已补：`/api/tasks/**`
+     走 `ControlAuthFilter`，`X-KM-Api-Key` → (租户, 操作者, 角色)，USER /
+     SERVICE 两种角色；状态上报和心跳只收 SERVICE，跨租户读一律 404 而不是
+     403（不做存在性泄露）。验收 `scripts/verify_control_auth.py`（25/25）。
+     注意两个入口是**两套信任模型**：`/api/audit/**` 用共享 token（这条），
+     `/api/tasks/**` 用按调用方区分的密钥表（那条），不要合并成"全局鉴权"。
    - **`unverified` / `late` 没有接指标系统。** 它们现在只出现在 202 响应和
      日志里，没有趋势、没有告警。要回答"这周身份核对失败率是不是涨了"，
      还得先把 Micrometer 接上。

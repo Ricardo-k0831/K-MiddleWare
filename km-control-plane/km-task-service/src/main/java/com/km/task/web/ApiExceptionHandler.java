@@ -15,6 +15,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.stream.Collectors;
 
@@ -144,6 +145,24 @@ public class ApiExceptionHandler {
     public ResponseEntity<ApiError> handleUnreadable(HttpMessageNotReadableException ex) {
         return ResponseEntity.badRequest()
                 .body(new ApiError("MALFORMED_BODY", ex.getMostSpecificCause().getMessage()));
+    }
+
+    /**
+     * 路径压根不存在 —— Spring 找不到对应的 handler, 静态资源也没找到。
+     *
+     * <p><b>不接这一条, 它会落进下面的兜底变成 500 + 一整条 ERROR 堆栈。</b>
+     * 扫描器随便扫一个路径、前端拼错一个 URL、运维手敲错一次
+     * {@code /actuator/health}, 都会在日志里留下一条"服务端故障",
+     * 而真正的故障就埋在这一堆假故障里。
+     *
+     * <p>所以这里既不记 WARN 也不记 ERROR, 只记 DEBUG:
+     * 这不是异常, 是有人在访问一个不存在的地址。
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ApiError> handleNoResource(NoResourceFoundException ex) {
+        log.debug("路径不存在: {} {}", ex.getHttpMethod(), ex.getResourcePath());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(new ApiError("NOT_FOUND", "接口不存在"));
     }
 
     /** 兜底。走到这里说明是服务端自己的 bug, 必须留下完整堆栈。 */
