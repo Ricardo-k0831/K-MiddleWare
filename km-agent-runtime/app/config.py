@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.0  # Agent 场景要确定性, 不要创造力
+    # Agent 系统提示词的变体: default | weak。
+    #
+    # "weak" 不是给生产用的, 是反思闭环的**对照实验**入口: 把提示词里
+    # "不要编造 / 先调工具再回答" 这些约束拿掉, 试图造一个真实会出错的基线。
+    #
+    # 实测结论 (2026-11-12, 三版弱提示词): deepseek-chat 依然 15-16/16,
+    # 提示词扰动不足以制造可归因的失败。所以反思的量化改用了缺陷注入
+    # (evals/reflection_check.py), 这里保留入口以便换模型后重新做对照。
+    # 详见 docs/agent-evals.md 第五节。
+    agent_prompt_variant: str = "default"
 
     # ---------- MCP ----------
     mcp_order_server_url: str = "http://localhost:8081/mcp"

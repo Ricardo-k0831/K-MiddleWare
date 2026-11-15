@@ -157,6 +157,8 @@ curl -H 'X-KM-Api-Key: dev-user-key-change-me' \
 - [`docs/task-state-machine.md`](docs/task-state-machine.md) — 状态机、重试、心跳兜底、
   取消、会话/线程身份与断点续跑的完整设计
 - [`docs/audit.md`](docs/audit.md) — 四层审计的数据模型、投递链路、身份核对与已知边界
+- [`docs/agent-evals.md`](docs/agent-evals.md) — 轨迹评估（金标准集 / 断言 + judge）、
+  反思闭环的设计取舍，以及缺陷注入实验的量化结果
 
 ---
 
@@ -242,8 +244,10 @@ K_middleware/
 │   ├── app/mcp_adapter/          ★ MCP 协议适配层
 │   ├── app/graph/                LangGraph 编排
 │   ├── app/checkpoint.py         会话记忆后端（memory / postgres）
+│   ├── app/reflection.py         ★ 反思闭环：critic → 带反馈重答
+│   ├── evals/                    ★ 轨迹评估：金标准集 / 断言 + judge / 缺陷注入
 │   └── tests/                    ★ 含 MCP 握手、任务链路、审计、断点续跑测试
-├── docs/                         设计文档（状态机 / 审计）
+├── docs/                         设计文档（状态机 / 审计 / 评测）
 └── docker/migrations/            增量迁移（老 volume 不会重跑 init 里的建表）
 ```
 
@@ -281,6 +285,14 @@ K_middleware/
   - `X-KM-Api-Key` → (租户, 操作者, 角色)，USER / SERVICE 两种角色
   - 跨租户读一律 404（不做存在性泄露）；审计 `actor` 变成真正的调用方
   - 验收：`km-control-plane/scripts/verify_control_auth.py`
+- [x] Agent 轨迹评估 + 反思闭环 ← ✅ 2026-11-12
+  - 16 条金标准用例，数据源是四层审计轨迹（`GET /api/tasks/{id}/trajectory`），
+    同时验证答复质量与"中间件有没有记下来"
+  - 确定性断言 + LLM-as-judge；强基线 16/16（judge 均分 92.9）
+  - critic → 带反馈重答，默认关闭、fail-open，质检调用本身也落审计
+  - 开反思与基线同为 16/16、0 次重答，token +45% —— 这就是它默认关闭的理由
+  - 缺陷注入：干净答复 0 误报，编造事实 16/16 检出、16/16 修复
+  - 方法见 [`docs/agent-evals.md`](docs/agent-evals.md)
 - [ ] 全链路 OTel 追踪、Token 指标、Micrometer 指标与审计采样率策略
 - [ ] Prompt 注入防护
 - [ ] SSE 流式输出

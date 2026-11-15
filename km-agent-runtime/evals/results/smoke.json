@@ -1,0 +1,95 @@
+{
+  "generatedAt": "2026-11-11T16:56:25.822556+00:00",
+  "config": {
+    "dataset": "dataset.jsonl",
+    "model": "deepseek-chat",
+    "reflect": false,
+    "maxReflections": 1,
+    "judge": true
+  },
+  "summary": {
+    "cases": 1,
+    "passed": 1,
+    "passRate": 1.0,
+    "judgeAvgScore": 95.0,
+    "judgeErrors": 0,
+    "infrastructureErrors": 0,
+    "degradedCalls": 0,
+    "errors": 0,
+    "avgToolCalls": 1.0,
+    "reflectionRounds": 0,
+    "reflectionRetries": 0,
+    "tokenIn": 1407,
+    "tokenOut": 111
+  },
+  "compare": {},
+  "cases": [
+    {
+      "caseId": "order_status",
+      "question": "帮我查一下订单 SO20260901001 的状态",
+      "answer": "订单 SO20260901001 的详情：\n\n- 商品：机械键盘 87 键\n- 金额：499.00 元\n- 状态：已支付（PAID）\n- 下单时间：2026-11-07 15:29:36\n- 所属用户：U1001",
+      "passed": true,
+      "deterministicOk": true,
+      "checks": [
+        {
+          "name": "答复包含 ['SO20260901001']",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "答复包含 ['机械键盘', '键盘']",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "答复包含 ['已支付', '已付款', 'PAID', '支付']",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "答复不包含 '不存在'",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "调用了 get_order_by_id",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "没有调用 list_orders_by_user",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "工具调用不超过 2 次",
+          "ok": true,
+          "detail": "实际 1 次: ['get_order_by_id']"
+        }
+      ],
+      "judge": {
+        "passed": true,
+        "score": 95,
+        "reason": "答复中的商品(机械键盘 87 键)、金额(499.00)、状态(PAID)、下单时间(2026-11-07 15:29:36)、用户(U1001)均与 get_order_by_id 返回一致，且未编造物流或送达时间。",
+        "error": ""
+      },
+      "stats": {
+        "rows": 10,
+        "llmCalls": 2,
+        "runtimeToolCalls": 1,
+        "gatewayToolCalls": 1,
+        "legacyCalls": 1,
+        "degraded": 0,
+        "errors": 0,
+        "tokenIn": 1407,
+        "tokenOut": 111
+      },
+      "tools": [
+        "get_order_by_id"
+      ],
+      "reflections": [],
+      "latencyMs": 5367,
+      "error": ""
+    }
+  ]
+}

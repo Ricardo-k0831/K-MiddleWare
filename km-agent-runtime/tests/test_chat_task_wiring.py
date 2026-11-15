@@ -420,6 +420,64 @@ def test_任务链路的上报和心跳都带SERVICE密钥(wired):
     assert fake.beaters[0].seen_api_key == expected, "心跳没带 SERVICE 密钥"
 
 
+def test_开启反思时质检结论回显且重答带上反馈(wired, monkeypatch):
+    """/chat 的接线: reflect=true 时才跑闭环, 而且重答必须还是同一条任务链路。
+
+    这里用假 critic + 假 Agent, 验的是三件事:
+    * 结论回显在响应里 (评测脚本靠它统计"反思了几轮、修没修好");
+    * 重答时 payload 里真的带着 [自检反馈], 不是把原问题再问一遍;
+    * 反思期间状态上报里有 phase=reflection —— 否则从事件表完全看不出
+      这轮为什么跑了两遍。
+    """
+    import json as _json
+
+    class FakeCritic:
+        def __init__(self) -> None:
+            self.replies = [
+                _json.dumps({"passed": False, "score": 30,
+                             "issues": ["编造了送达时间"], "fix_hint": "删掉时间"}),
+                _json.dumps({"passed": True, "score": 90, "issues": [], "fix_hint": ""}),
+            ]
+
+        async def ainvoke(self, messages, config=None):
+            return AIMessage(content=self.replies.pop(0))
+
+    fake, _ = wired
+    monkeypatch.setattr(main_module.state, "critic", FakeCritic())
+
+    agent = FakeAgent()
+    resp = post_chat(agent, {
+        "message": "SO20260901001 什么时候到",
+        "task_id": TASK_ID,
+        "trace_id": TRACE_ID,
+        "reflect": True,
+        "max_reflections": 1,
+    })
+
+    assert resp.status_code == 200
+    reports = resp.json()["reflections"]
+    assert [r["passed"] for r in reports] == [False, True]
+    assert reports[0]["issues"] == ["编造了送达时间"]
+
+    # 第一次执行 + 一次重答
+    assert len(agent.payloads) == 2
+    feedback = agent.payloads[1]["messages"][0]
+    assert "编造了送达时间" in feedback.content
+    assert feedback.additional_kwargs["km_reflection"] == 1
+
+    phases = [item.get("detail", {}).get("phase") for item in fake.status_reports]
+    assert "reflection" in phases, "反思期间没有状态上报, 事件表里看不出跑了两遍"
+
+
+def test_默认不开启反思(wired):
+    fake, _ = wired
+    agent = FakeAgent()
+    resp = post_chat(agent, {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})
+
+    assert resp.json()["reflections"] == []
+    assert len(agent.payloads) == 1, "默认开启了反思 —— 每轮都多花一次 LLM 调用"
+
+
 def test_终态detail里带着最终答复(wired):
     fake, _ = wired
     post_chat(FakeAgent(reply="订单已发货"), {"message": "查订单", "task_id": TASK_ID, "trace_id": TRACE_ID})

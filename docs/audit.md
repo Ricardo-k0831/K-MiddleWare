@@ -779,11 +779,11 @@ TOOL_CALLING → THINKING             source=PYTHON_RUNTIME  detail.phase=llm
 THINKING     → COMPLETED            source=PYTHON_RUNTIME  detail.result=...
 ```
 
-### 6. 单元测试（当前量，2026-11-09）
+### 6. 单元测试（当前量，2026-11-12）
 
 ```bash
 cd km-control-plane && mvn install
-# —— 合计 196 (Java) ——
+# —— 合计 199 (Java) ——
 # km-audit-core        AuditPublisherTest                 12
 # km-mcp-server        CallStatusTest                      12   (含 DEGRADED / isBackendFailure)
 #                      McpToolAuditTest                    10
@@ -806,9 +806,10 @@ cd km-control-plane && mvn install
 #                      PythonCancelNotifierTest             4
 #                      TaskCancellationServiceTest          3
 #                      ReportStatusRequestTest              3   (traceId 必填契约)
+#                      TrajectoryControllerTest             3   (字段契约 + 跨租户 404)  ← 2026-11-12
 
 cd km-agent-runtime && uv run pytest
-# 173 passed   (服务全起时不再跳过 MCP 握手用例)
+# 211 passed   (服务全起时不再跳过 MCP 握手用例)
 ```
 
 > 这个数字维护在**一处**：上一节「单元测试」只写规模，不抄清单 —— 两处各写

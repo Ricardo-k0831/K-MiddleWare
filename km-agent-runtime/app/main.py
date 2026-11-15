@@ -29,6 +29,7 @@ from app.checkpoint import (
     BACKEND_POSTGRES,
     MODE_BUSY,
     MODE_FRESH,
+    MODE_REPLAY,
     CheckpointResources,
     build_checkpointer,
     memory_resources,
@@ -37,7 +38,8 @@ from app.checkpoint import (
     resolve_thread_id,
 )
 from app.config import get_settings
-from app.graph.agent import build_agent
+from app.graph.agent import build_agent, build_llm
+from app.reflection import reflect_loop
 from app.heartbeat import HeartbeatBeater, LivenessRegistry
 from app.mcp_adapter import TaskIdentity, ToolProvider, build_tool_provider, task_identity
 from app.task_state import (
@@ -85,6 +87,10 @@ class AppState:
 
     provider: ToolProvider | None = None
     agent: Any = None
+    # 质检员 (critic)。和 agent 共用供应商和模型, 但固定 temperature=0。
+    # 单独放一个客户端而不是每次请求新建: httpx 连接池会跟着复用, 而且
+    # "反思用的到底是哪个模型"在启动日志里能一眼看到。
+    critic: Any = None
     startup_error: str | None = None
     # checkpointer 及其连接池。收尾时必须显式关闭 —— 漏了不会报错,
     # 只会让进程退出时挂住, 或者 Postgres 那边堆一堆 idle 连接。
@@ -206,6 +212,10 @@ async def lifespan(app: FastAPI):
     if state.checkpoints is not None:
         try:
             state.agent = await build_agent(provider, settings, state.checkpoints.saver)
+            # 质检员和 Agent 用同一个模型, 固定 temperature=0。它只在请求
+            # 显式打开 reflect 时才会被调用 (见 app/reflection.py 的代价说明),
+            # 启动时建好只是省掉每个请求一次客户端构造。
+            state.critic = build_llm(settings, temperature=0.0)
             logger.info("Agent 运行时启动完成")
         except Exception as ex:
             # 启动失败不直接退出进程 —— 让 /health 和 /agent/tools 还能回答问题,
@@ -310,6 +320,29 @@ class ChatRequest(BaseModel):
         ),
     )
 
+    # ---- 反思闭环 (默认关闭) ----
+    #
+    # 打开后: 回答完先让质检员 (app/reflection.py) 判一次; 不合格就带着
+    # 具体问题重跑, 最多 max_reflections 次。每轮多一次 LLM 调用 (质检),
+    # 不合格还要多一次完整回答 —— 这是给"准确性 > 成本"的场景用的,
+    # 所以默认关闭, 由调用方显式打开 (评测脚本就是这么用的)。
+    #
+    # 为什么不放进系统提示词/全局配置: 同一套运行时里, 闲聊和关键业务
+    # 对成本的容忍度完全不同。让调用方按请求选择, 比替他决定更诚实。
+    reflect: bool = Field(
+        default=False,
+        description="是否在回答后做一次自检, 不合格则带着反馈重答",
+    )
+    max_reflections: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        description=(
+            "最多重答几次 (0 = 只自检不重答)。上限 3 是成本护栏: "
+            "每轮都是一次完整执行, 放任下去会自己把自己跑成死循环"
+        ),
+    )
+
 
 class ChatResponse(BaseModel):
     reply: str
@@ -325,6 +358,10 @@ class ChatResponse(BaseModel):
     # 同上的理由: 回显它, 验收脚本才能拿它去 audit_log 里对账
     # ("我发出去的身份"和"数据库收到的身份"是不是同一个)。
     trace_id: str | None = None
+    # 反思闭环的体检报告: 每轮一条 {round, passed, score, issues, fixHint}。
+    # 没开 reflect 时是空数组 —— "没做"和"做了但全过"必须分得开, 否则
+    # 评测分不清"反思有效"和"反思根本没跑"。
+    reflections: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CancelRequest(BaseModel):
@@ -787,10 +824,54 @@ async def chat(req: ChatRequest) -> ChatResponse:
                         task_id=task_id,
                     )
 
+                    # ★ 反思闭环 ★ 放在锁内、紧挨着第一次执行 —— 重答写的
+                    # 是同一个会话线程, 出了锁就可能和同会话的下一个请求
+                    # 互踩分支 (理由和 _thread_lock 那段一样)。
+                    #
+                    # replay 例外: 那是"终态上报丢了, 别再问一遍 LLM"的路径,
+                    # 在这里补一次质检等于把刚省下的钱又花回去, 还会往
+                    # checkpoint 里写新消息 —— 重试的幂等性就被破坏了。
+                    messages = result.get("messages", [])
+                    reflections: list[dict[str, Any]] = []
+                    if (
+                        req.reflect
+                        and state.critic is not None
+                        and plan.mode != MODE_REPLAY
+                    ):
+                        # 反思循环进行THINKING状态报告
+                        def _on_round(round_no: int, critique: Any) -> None:
+                            # 状态上报THINKING
+                            if reporter is not None:
+                                reporter.report(THINKING, {
+                                    "phase": "reflection",
+                                    "round": round_no,
+                                    "score": critique.score,
+                                    "passed": critique.passed,
+                                })
+                        # 带着修正反馈再跑一次 LLM
+                        async def _invoke(payload: Any) -> Any:
+                            return await _run_agent(
+                                state.agent, payload, config=config, task_id=task_id
+                            )
+                        # 调用反思循环
+                        outcome = await reflect_loop(
+                            question=req.message,
+                            messages=messages,
+                            llm=state.critic,
+                            invoke=_invoke,
+                            max_revisions=req.max_reflections,
+                            config=config,
+                            on_round=_on_round,
+                        )
+                        # 获取最终态消息列表
+                        messages = outcome.messages
+                        # 获取最终态质检报告列表
+                        reflections = outcome.reports
+
             # ReAct 循环产出的最后一条消息就是最终答复。
             # 注意 replay 时图一个节点都不跑, 返回的是上次的最终状态 ——
             # 这里取到的仍然是那个答复, 正是"终态上报丢了, 重试补一条"要的。
-            messages = result.get("messages", [])
+            # 开了反思时 messages 已在上面被替换成重答后的最终状态。
             reply = messages[-1].content if messages else ""
 
             # 只扫【本次 invocation 新增的】消息。
@@ -856,6 +937,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         tool_calls=tool_calls,
         task_id=task_id,
         trace_id=identity.trace_id if identity is not None else None,
+        reflections=reflections,
     )
 
 
