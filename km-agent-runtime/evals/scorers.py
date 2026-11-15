@@ -71,6 +71,26 @@ def runtime_tools(trajectory: list[dict]) -> list[str]:
     return names
 
 # 根据任务执行的审计记录列表 提取网关层调用的工具名称列表
+def runtime_tool_args(trajectory: list[dict]) -> list[str]:
+    """运行层每次工具调用的入参, 序列化成字符串。
+
+    为什么需要它: 长期记忆评测里, "调了对的工具"不够 —— 用哪个订单号去查
+    才是这次记忆有没有起作用的证据。只看工具名的话, 没记忆时硬猜一个订单号
+    也会被判"调用了 get_order_by_id"。
+    """
+    args: list[str] = []
+    for row in trajectory:
+        if row.get("layer") != LAYER_RUNTIME or row.get("eventType") != TYPE_TOOL_CALL:
+            continue
+        body = _json_or_none(row.get("requestBody"))
+        if body and "params" in body:
+            try:
+                args.append(json.dumps(body["params"], ensure_ascii=False))
+            except (TypeError, ValueError):
+                args.append(str(body["params"]))
+    return args
+
+
 def gateway_tools(trajectory: list[dict]) -> list[str]:
     names: list[str] = []
     for row in trajectory:
@@ -207,6 +227,22 @@ def deterministic_checks(
             ok=name not in tools,
             detail="" if name not in tools else f"实际工具序列: {tools}",
         ))
+    # 工具入参里是否出现了指定内容 (通常用来钉订单号 / 用户ID)。
+    # 只匹配运行层: 网关层的 params 形状不同, 混在一起会让断言时灵时不灵。
+    tool_args_blob = " ".join(runtime_tool_args(trajectory))
+    for needle in expect.get("tool_args_contain") or []:
+        checks.append(Check(
+            name=f"工具入参包含 {needle!r}",
+            ok=needle in tool_args_blob,
+            detail="" if needle in tool_args_blob else f"实际入参: {tool_args_blob[:300]}",
+        ))
+    # 反面断言: 用来证明"用的是最近那个, 不是更早那个"。
+    for needle in expect.get("tool_args_not_contain") or []:
+        checks.append(Check(
+            name=f"工具入参不包含 {needle!r}",
+            ok=needle not in tool_args_blob,
+            detail="" if needle not in tool_args_blob else f"实际入参: {tool_args_blob[:300]}",
+        ))
     # 工具调用次数是否超过最大次数
     max_calls = expect.get("max_tool_calls")
     if max_calls is not None:
@@ -330,6 +366,10 @@ class CaseResult:
     stats: dict[str, Any] = field(default_factory=dict)
     tools: list[str] = field(default_factory=list)
     reflections: list[dict[str, Any]] = field(default_factory=list)
+    # 长期记忆的本轮数字: 注入了几条 / 新写了几条。分开记, 是为了在报告里
+    # 直接排除"记忆根本没接上, 但答案碰巧对"这种误判。
+    memory_used: int = 0
+    memory_written: int = 0
     latency_ms: int | None = None
     error: str = ""
 
@@ -358,6 +398,8 @@ class CaseResult:
             "stats": self.stats,
             "tools": self.tools,
             "reflections": self.reflections,
+            "memoryUsed": self.memory_used,
+            "memoryWritten": self.memory_written,
             "latencyMs": self.latency_ms,
             "error": self.error,
         }

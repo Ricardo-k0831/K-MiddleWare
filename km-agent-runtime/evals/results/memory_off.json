@@ -1,0 +1,180 @@
+{
+  "generatedAt": "2026-11-15T07:12:18.908891+00:00",
+  "config": {
+    "dataset": "memory.jsonl",
+    "model": "deepseek-chat",
+    "reflect": false,
+    "maxReflections": 1,
+    "memory": false,
+    "judge": true
+  },
+  "summary": {
+    "cases": 3,
+    "passed": 0,
+    "passRate": 0.0,
+    "judgeAvgScore": 59.3,
+    "judgeErrors": 0,
+    "infrastructureErrors": 0,
+    "degradedCalls": 0,
+    "errors": 0,
+    "avgToolCalls": 0.0,
+    "reflectionRounds": 0,
+    "reflectionRetries": 0,
+    "tokenIn": 2218,
+    "tokenOut": 188
+  },
+  "compare": {},
+  "cases": [
+    {
+      "caseId": "mem_last_order",
+      "question": "上次那个订单现在怎么样了?",
+      "answer": "我需要更多信息才能查询。请提供以下任一项：\n\n- **订单号**（形如 SO20260901001），我直接查这一单；\n- **用户ID**（形如 U1001），我列出你名下所有订单，再帮你找\"上次那个\"。\n\n另外，\"上次那个\"具体指哪一单（大概的下单时间或商品）也可以说一下，方便我确认。",
+      "passed": false,
+      "deterministicOk": false,
+      "checks": [
+        {
+          "name": "答复包含 ['已支付', '已付款', 'PAID', '待发货']中的相关关键词",
+          "ok": false,
+          "detail": "实际答复: 我需要更多信息才能查询。请提供以下任一项：\n\n- **订单号**（形如 SO20260901001），我直接查这一单；\n- **用户ID**（形如 U1001），我列出你名下所有订单，再帮你找\"上次那个\"。\n\n另外，\"上次那个\"具体指哪一单"
+        },
+        {
+          "name": "答复包含 ['机械键盘', '键盘']中的相关关键词",
+          "ok": false,
+          "detail": "实际答复: 我需要更多信息才能查询。请提供以下任一项：\n\n- **订单号**（形如 SO20260901001），我直接查这一单；\n- **用户ID**（形如 U1001），我列出你名下所有订单，再帮你找\"上次那个\"。\n\n另外，\"上次那个\"具体指哪一单"
+        },
+        {
+          "name": "调用了 get_order_by_id",
+          "ok": false,
+          "detail": "实际工具序列: []"
+        },
+        {
+          "name": "工具入参包含 'SO20260901001'",
+          "ok": false,
+          "detail": "实际入参: "
+        }
+      ],
+      "judge": {
+        "passed": false,
+        "score": 45,
+        "reason": "用户以'上次那个订单'指代且长期记忆中有 SO20260901001，助手应据此重新查询实时状态，却反问订单号且未调用任何工具，未回答订单现状。",
+        "error": ""
+      },
+      "stats": {
+        "rows": 4,
+        "llmCalls": 1,
+        "runtimeToolCalls": 0,
+        "gatewayToolCalls": 0,
+        "legacyCalls": 0,
+        "degraded": 0,
+        "errors": 0,
+        "tokenIn": 739,
+        "tokenOut": 84
+      },
+      "tools": [],
+      "reflections": [],
+      "memoryUsed": 0,
+      "memoryWritten": 0,
+      "latencyMs": 8129,
+      "error": ""
+    },
+    {
+      "caseId": "mem_user_id",
+      "question": "我的订单现在都什么状态?",
+      "answer": "我需要先知道您的用户ID（形如 U1001）才能查询您名下的订单列表。您方便提供一下吗？",
+      "passed": false,
+      "deterministicOk": false,
+      "checks": [
+        {
+          "name": "答复包含 ['SO20260901001']中的相关关键词",
+          "ok": false,
+          "detail": "实际答复: 我需要先知道您的用户ID（形如 U1001）才能查询您名下的订单列表。您方便提供一下吗？"
+        },
+        {
+          "name": "调用了 list_orders_by_user",
+          "ok": false,
+          "detail": "实际工具序列: []"
+        },
+        {
+          "name": "工具入参包含 'U1001'",
+          "ok": false,
+          "detail": "实际入参: "
+        }
+      ],
+      "judge": {
+        "passed": false,
+        "score": 45,
+        "reason": "用户身份已知(U1001)却反问用户ID,未调用列表工具查询实时订单状态,属该查不查、答非所问。",
+        "error": ""
+      },
+      "stats": {
+        "rows": 4,
+        "llmCalls": 1,
+        "runtimeToolCalls": 0,
+        "gatewayToolCalls": 0,
+        "legacyCalls": 0,
+        "degraded": 0,
+        "errors": 0,
+        "tokenIn": 740,
+        "tokenOut": 27
+      },
+      "tools": [],
+      "reflections": [],
+      "memoryUsed": 0,
+      "memoryWritten": 0,
+      "latencyMs": 7534,
+      "error": ""
+    },
+    {
+      "caseId": "mem_most_recent_order",
+      "question": "上次那个订单现在怎么样了?",
+      "answer": "您说的“上次那个订单”我这边没法确定是哪一单。请提供以下任一信息：\n\n- 具体订单号（形如 SO20260901001）\n- 或者您的用户ID（形如 U1001），我帮您列出名下所有订单，再一起看\n\n另外，如果您能补充大概的下单时间或商品，也能帮我更快定位。",
+      "passed": false,
+      "deterministicOk": false,
+      "checks": [
+        {
+          "name": "答复包含 ['已发货', 'SHIPPED']中的相关关键词",
+          "ok": false,
+          "detail": "实际答复: 您说的“上次那个订单”我这边没法确定是哪一单。请提供以下任一信息：\n\n- 具体订单号（形如 SO20260901001）\n- 或者您的用户ID（形如 U1001），我帮您列出名下所有订单，再一起看\n\n另外，如果您能补充大概的下单时间或商品，"
+        },
+        {
+          "name": "调用了 get_order_by_id",
+          "ok": false,
+          "detail": "实际工具序列: []"
+        },
+        {
+          "name": "工具入参包含 'SO20260901002'",
+          "ok": false,
+          "detail": "实际入参: "
+        },
+        {
+          "name": "工具入参不包含 'SO20260901001'",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "judge": {
+        "passed": true,
+        "score": 88,
+        "reason": "本次无工具返回，助手未编造任何业务数据，而是追问订单号或用户ID，符合关键信息缺失时应追问的要求；虽未利用会话中最近提到的订单号，但答复本身无事实错误。",
+        "error": ""
+      },
+      "stats": {
+        "rows": 4,
+        "llmCalls": 1,
+        "runtimeToolCalls": 0,
+        "gatewayToolCalls": 0,
+        "legacyCalls": 0,
+        "degraded": 0,
+        "errors": 0,
+        "tokenIn": 739,
+        "tokenOut": 77
+      },
+      "tools": [],
+      "reflections": [],
+      "memoryUsed": 0,
+      "memoryWritten": 0,
+      "latencyMs": 12016,
+      "error": ""
+    }
+  ]
+}

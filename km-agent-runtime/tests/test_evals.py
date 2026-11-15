@@ -153,6 +153,47 @@ def test_没声明的维度不产生断言():
     assert checks == []
 
 
+def test_工具入参断言能区分用哪个订单号查询():
+    """长期记忆评测的关键: 调了工具不算赢, 用记忆里的订单号调才算。"""
+    traj = [
+        _row(
+            "AGENT_RUNTIME",
+            "MCP_TOOL_CALL",
+            tool="get_order_by_id",
+            request={"tool": "get_order_by_id", "params": {"orderId": "SO20260901002"}},
+        )
+    ]
+    case = {
+        "id": "mem",
+        "expect": {
+            "tool_args_contain": ["SO20260901002"],
+            "tool_args_not_contain": ["SO20260901001"],
+        },
+    }
+
+    checks = deterministic_checks(case, "", traj)
+
+    assert len(checks) == 2
+    assert all(check.ok for check in checks)
+
+
+def test_用错订单号时入参断言失败并给出实际值():
+    traj = [
+        _row(
+            "AGENT_RUNTIME",
+            "MCP_TOOL_CALL",
+            tool="get_order_by_id",
+            request={"tool": "get_order_by_id", "params": {"orderId": "SO20260901001"}},
+        )
+    ]
+    case = {"id": "mem", "expect": {"tool_args_not_contain": ["SO20260901001"]}}
+
+    checks = deterministic_checks(case, "", traj)
+
+    assert [check.ok for check in checks] == [False]
+    assert "SO20260901001" in checks[0].detail
+
+
 # ----------------------------------------------------------------------
 #  judge
 # ----------------------------------------------------------------------

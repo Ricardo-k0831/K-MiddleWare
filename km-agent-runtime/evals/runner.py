@@ -32,7 +32,7 @@ import json
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -78,14 +78,19 @@ class Services:
     async def aclose(self) -> None:
         await self.client.aclose()
     # 向java侧发起请求创建任务 返回AgentTask的json字符串
-    async def create_task(self, *, question: str, session_id: str) -> dict:
+    async def create_task(
+        self, *, question: str, session_id: str, actor: str = ACTOR
+    ) -> dict:
         # response 为返回AgentTask的json字符串
         response = await self.client.post(
             f"{self.settings.km_task_service_url.rstrip('/')}/api/tasks",
             # 传入/api/tasks 相关路径的认证鉴权过滤器 header
             headers=self.control_headers,
             json={
-                "userId": ACTOR,
+                # actor 进 agent_task.user_id, 同时也是长期记忆的分区键。
+                # 多会话用例必须用同一个 actor 运行所有会话, 否则第二个会话
+                # 读不到第一个会话写的记忆, 测的就不是记忆了。
+                "userId": actor,
                 "sessionId": session_id,
                 "intent": question,
                 "tenantId": TENANT,
@@ -96,7 +101,16 @@ class Services:
         response.raise_for_status()
         return response.json()
     # 向python侧发起请求聊天 返回聊天结果的json字符串(包含会话id、任务id、轨迹id、调用工具的集合、reflect)
-    async def chat(self, *, question: str, task: dict, reflect: bool, max_reflections: int) -> dict:
+    async def chat(
+        self,
+        *,
+        question: str,
+        task: dict,
+        reflect: bool,
+        max_reflections: int,
+        use_memory: bool = False,
+        actor: str = ACTOR,
+    ) -> dict:
         # response 为返回聊天结果的json字符串
         response = await self.client.post(
             f"{self.agent_url}/chat",
@@ -106,9 +120,12 @@ class Services:
                 "trace_id": task["traceId"],
                 "session_id": task.get("sessionId"),
                 "tenant_id": task.get("tenantId") or TENANT,
-                "actor": ACTOR,
+                "actor": actor,
                 "reflect": reflect,
                 "max_reflections": max_reflections,
+                # 显式传, 不依赖服务配置: 同一个进程里才能跑有/无记忆的对照。
+                # 老化验集不传时默认 false, 它们的历史数字因此保持可比。
+                "use_memory": use_memory,
             },
         )
         response.raise_for_status()
@@ -180,31 +197,55 @@ async def run_case(
     *,
     reflect: bool,
     max_reflections: int,
+    use_memory: bool = False,
+    run_id: str | None = None,
 ) -> CaseResult:
     # 获取用例id, 用户问题列表, 组装sessionId
     case_id = case["id"]
-    turns: list[str] = case.get("turns") or [case["question"]]
-    session_id = f"eval-{uuid.uuid4().hex[:8]}-{case_id}"
+    # 多会话用例 (长期记忆): 每个 sessions 元素是一个独立的 session,
+    # 会话之间有各自的 thread/checkpoint, 唯一把它们连起来的是 actor ——
+    # 也就是长期记忆的分区键。老用例没有 sessions, 仍是一条会话多个 turn。
+    session_defs: list[list[str]]
+    if case.get("sessions"):
+        session_defs = [list(s.get("turns") or []) for s in case["sessions"]]
+    else:
+        session_defs = [list(case.get("turns") or [case.get("question") or ""])]
+    all_turns = [question for turns in session_defs for question in turns]
+    last_question = all_turns[-1] if all_turns else ""
+
+    # ★ actor 每次运行重新生成 ★
+    # 长期记忆按 (租户, actor) 隔离。如果所有用例共用一个固定 actor,
+    # 上一个用例记住的订单会漏进下一个用例 —— 评测就变成了"考记忆串味"。
+    # run_id 保证这是一次全新的记忆空间; 用例内所有会话共享同一个 actor。
+    run_id = run_id or uuid.uuid4().hex[:8]
+    actor = f"eval-{run_id}-{case_id}"[:128]
 
     started = time.perf_counter()
     last: dict[str, Any] = {}
     task: dict[str, Any] = {}
     try:
-        # 遍历用户问题列表 调用create_task创建任务, 调用chat返回聊天结果
-        for question in turns:
-            task = await services.create_task(question=question, session_id=session_id)
-            last = await services.chat(
-                question=question,
-                task=task,
-                reflect=reflect,
-                max_reflections=max_reflections,
-            )
+        # 遍历会话, 每个会话内遍历用户问题
+        for index, turns in enumerate(session_defs):
+            session_id = f"eval-{run_id}-{case_id}-s{index}"
+            for question in turns:
+                # 调用create_task创建任务, 调用chat返回聊天结果
+                task = await services.create_task(
+                    question=question, session_id=session_id, actor=actor
+                )
+                last = await services.chat(
+                    question=question,
+                    task=task,
+                    reflect=reflect,
+                    max_reflections=max_reflections,
+                    use_memory=use_memory,
+                    actor=actor,
+                )
     # 出了异常 手动组装CaseResult封装异常信息
     except httpx.HTTPError as ex:
         body = getattr(getattr(ex, "response", None), "text", "")
         return CaseResult(
             case_id=case_id,
-            question=turns[-1],
+            question=last_question,
             answer="",
             error=f"{type(ex).__name__}: {ex} {body[:300]}",
         )
@@ -230,20 +271,24 @@ async def run_case(
         judge = await judge_case(
             judge_llm,
             case=case,
-            question=turns[-1],
+            question=last_question,
             answer=answer,
             trajectory=trajectory,
         )
 
     return CaseResult(
         case_id=case_id,
-        question=turns[-1],
+        question=last_question,
         answer=answer,
         checks=checks,
         judge=judge,
         stats=trajectory_stats(trajectory),
         tools=runtime_tools(trajectory),
         reflections=list(last.get("reflections") or []),
+        # 最后一轮的数字。跨会话用例里, 第二个会话的 memory_used 才是
+        # "记忆起作用"的直接证据; 第一个会话的 memory_written 是"写进去了"。
+        memory_used=int(last.get("memory_used") or 0),
+        memory_written=int(last.get("memory_written") or 0),
         latency_ms=latency_ms,
         error=error,
     )
@@ -275,6 +320,10 @@ def print_case(result: CaseResult) -> None:
             f"{r.get('score')}{'✓' if r.get('passed') else '✗'}" for r in result.reflections
         )
         print(f"          ~ 反思: {rounds}")
+    if result.memory_used or result.memory_written:
+        print(
+            f"          ~ 记忆: 注入 {result.memory_used} 条 / 写入 {result.memory_written} 条"
+        )
 
 
 def write_report(path: Path, payload: dict[str, Any]) -> None:
@@ -315,10 +364,15 @@ async def main_async(args: argparse.Namespace) -> int:
         judge_llm = build_llm(settings, temperature=0.0)
 
     mode = "反思开启" if args.reflect else "基线 (不反思)"
+    if args.memory:
+        mode += " + 长期记忆"
     print(f"评测 {len(cases)} 条用例 · {mode} · 模型 {settings.llm_model}")
     print("=" * 78)
 
     services = Services(settings, args.agent_url)
+    # 一次评测运行共享同一个 run_id: 记忆的 actor 前缀靠它做到"每次运行
+    # 都是全新的记忆空间", 又能在同一用例内跨会话共享。
+    run_id = uuid.uuid4().hex[:8]
     results: list[CaseResult] = []
     try:
         for case in cases:
@@ -328,6 +382,8 @@ async def main_async(args: argparse.Namespace) -> int:
                 judge_llm,
                 reflect=args.reflect,
                 max_reflections=args.max_reflections,
+                use_memory=args.memory,
+                run_id=run_id,
             )
             results.append(result)
             print_case(result)
@@ -365,12 +421,13 @@ async def main_async(args: argparse.Namespace) -> int:
         )
 
     payload = {
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "generatedAt": datetime.now(UTC).isoformat(),
         "config": {
             "dataset": str(Path(args.dataset).name),
             "model": settings.llm_model,
             "reflect": args.reflect,
             "maxReflections": args.max_reflections,
+            "memory": args.memory,
             "judge": judge_llm is not None,
         },
         "summary": summary,
@@ -391,6 +448,11 @@ def main() -> int:
     parser.add_argument("--only", default=None, help="只跑这些 id, 逗号分隔")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--reflect", action="store_true", help="打开反思闭环")
+    parser.add_argument(
+        "--memory",
+        action="store_true",
+        help="打开跨会话长期记忆 (读 + 写)。多会话用例必须加这个才有意义",
+    )
     parser.add_argument("--max-reflections", type=int, default=1)
     parser.add_argument("--no-judge", action="store_true", help="只跑确定性断言")
     parser.add_argument(

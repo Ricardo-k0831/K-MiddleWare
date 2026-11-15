@@ -34,7 +34,7 @@ import json
 import httpx
 import pytest
 from fastapi import HTTPException
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 import app.main as main_module
@@ -1220,3 +1220,177 @@ def test_取消能收尾没有在跑的挂起(wired):
     assert as_node == "agent", "收尾要以 ReAct 的 agent 节点身份写, 条件边才会判 END"
     assert config["configurable"]["thread_id"] == "session:km:s-1"
     assert values["messages"], "必须写入一条终止消息, 否则 next 不会被清空"
+
+
+# ----------------------------------------------------------------------
+#  跨会话长期记忆的接线
+# ----------------------------------------------------------------------
+#
+# 记忆本体在 tests/test_memory.py 里单测; 这里只验 /chat 有没有把它接对:
+# 检索到的记忆有没有进本轮输入、没有 actor 时会不会越权读、读失败会不会
+# 把一次正常对话变成 500、抽取到的事实有没有真的落库。
+
+
+class FakeMemoryStore:
+    """假的记忆存储。只实现 /chat 会调到的三个方法。"""
+
+    def __init__(self, items=None, *, fail_read: bool = False) -> None:
+        self.items = list(items or [])
+        self.fail_read = fail_read
+        self.marked: list[dict] = []
+        self.added: list[dict] = []
+
+    async def recent(self, *, tenant_id: str, actor_id: str, limit: int = 100):
+        if self.fail_read:
+            raise RuntimeError("Postgres 抖了")
+        # 记录分区键, 断言隔离有没有被真的用上
+        self.last_scope = (tenant_id, actor_id)
+        return self.items
+
+    async def mark_used(self, *, tenant_id: str, actor_id: str, contents: list[str]):
+        self.marked.append({"tenant": tenant_id, "actor": actor_id, "contents": contents})
+
+    async def add(self, **kwargs):
+        self.added.append(kwargs)
+        return len(kwargs.get("facts") or [])
+
+
+def post_chat_with_memory(
+    agent: FakeAgent,
+    store: FakeMemoryStore | None,
+    body: dict,
+    *,
+    critic: object | None = None,
+) -> httpx.Response:
+    """打一次 /chat, 顺带把 state.memories / state.critic 换成测试值。"""
+
+    async def _go() -> httpx.Response:
+        original_agent = main_module.state.agent
+        original_memories = main_module.state.memories
+        original_critic = main_module.state.critic
+        main_module.state.agent = agent
+        main_module.state.memories = store
+        main_module.state.critic = critic
+        try:
+            transport = httpx.ASGITransport(app=main_module.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.post("/chat", json=body)
+        finally:
+            main_module.state.agent = original_agent
+            main_module.state.memories = original_memories
+            main_module.state.critic = original_critic
+
+    return asyncio.run(_go())
+
+
+def _order_memory():
+    from app.memory import KIND_ORDER_REF, MemoryItem
+
+    return MemoryItem(
+        kind=KIND_ORDER_REF,
+        content="用户查询过订单 SO20260901001",
+        order_id="SO20260901001",
+    )
+
+
+def test_开启记忆时把检索结果放进本轮输入(wired):
+    store = FakeMemoryStore([_order_memory()])
+    agent = FakeAgent()
+
+    resp = post_chat_with_memory(
+        agent,
+        store,
+        {
+            "message": "上次那个订单现在怎么样了?",
+            "thread_id": "t-memory",
+            "tenant_id": "demo",
+            "actor": "U1001",
+            "use_memory": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = agent.payloads[0]
+    assert payload is not None
+    first = payload["messages"][0]
+    assert isinstance(first, SystemMessage), "记忆必须以 system 消息注入, 不能伪装成用户的话"
+    assert first.additional_kwargs.get("km_memory") is True
+    assert "SO20260901001" in first.content
+    assert payload["messages"][1]["role"] == "user"
+    assert resp.json()["memory_used"] == 1
+    assert store.marked and store.marked[0]["actor"] == "U1001"
+
+
+def test_没有actor时即使打开记忆也不读(wired):
+    store = FakeMemoryStore([_order_memory()])
+    agent = FakeAgent()
+
+    resp = post_chat_with_memory(
+        agent,
+        store,
+        {
+            "message": "上次那个订单现在怎么样了?",
+            "thread_id": "t-memory-anon",
+            "tenant_id": "demo",
+            "use_memory": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert not hasattr(store, "last_scope"), "没有隔离键时不该去读记忆"
+    assert resp.json()["memory_used"] == 0
+    assert isinstance(agent.payloads[0]["messages"][0], dict), "不该注入 SystemMessage"
+
+
+def test_记忆读取失败不影响对话(wired):
+    store = FakeMemoryStore(fail_read=True)
+    agent = FakeAgent()
+
+    resp = post_chat_with_memory(
+        agent,
+        store,
+        {
+            "message": "上次那个订单现在怎么样了?",
+            "thread_id": "t-memory-broken",
+            "tenant_id": "demo",
+            "actor": "U1001",
+            "use_memory": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["memory_used"] == 0
+    assert agent.payloads[0]["messages"][0]["role"] == "user"
+
+
+def test_抽取到的事实会落库并回显条数(wired, monkeypatch):
+    from app.memory import KIND_USER_REF, MemoryFact
+
+    store = FakeMemoryStore()
+    agent = FakeAgent()
+    calls: list[list] = []
+
+    async def fake_extract(llm, messages, *, config=None):
+        calls.append(messages)
+        return [MemoryFact(kind=KIND_USER_REF, content="用户自述用户ID为 U1001")]
+
+    monkeypatch.setattr(main_module, "extract_memories", fake_extract)
+
+    resp = post_chat_with_memory(
+        agent,
+        store,
+        {
+            "message": "我是 U1001",
+            "thread_id": "t-memory-write",
+            "tenant_id": "demo",
+            "actor": "U1001",
+            "use_memory": True,
+        },
+        critic=object(),  # 非 None 即表示"抽取器可用"
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["memory_written"] == 1
+    assert store.added and store.added[0]["tenant_id"] == "demo"
+    assert store.added[0]["actor_id"] == "U1001"
+    assert calls, "抽取器必须能看到本轮新增消息"

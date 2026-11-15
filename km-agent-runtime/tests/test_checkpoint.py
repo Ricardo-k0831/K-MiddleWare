@@ -295,6 +295,8 @@ def test_自由对话已完成的历史不触发复述():
         plan = await plan_invocation(graph, config, "查订单")
         assert plan.mode == MODE_FRESH
         assert plan.baseline_messages == 2
+        # 长期记忆注入靠它去重: 必须带着"这个 thread 里已经有什么"。
+        assert [m.content for m in plan.prior_messages] == ["你好", "答案"]
 
     asyncio.run(_go())
 

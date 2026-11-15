@@ -1,0 +1,18 @@
+# 跨会话长期记忆用例 (长期记忆的量化)。
+#
+# 每条用例由多个 sessions 组成 —— 会话之间 thread/checkpoint 完全隔离,
+# 唯一共享的是 actor (长期记忆的分区键)。第二个会话的问题里**故意不含**
+# 任何可调工具的标识符 (订单号 / 用户ID), 它只能来自第一个会话留下的记忆。
+#
+# 因此"无记忆"基线一定失败, 这不是模型能力问题, 而是信息物理上不在上下文里。
+# 有记忆时, 断言要求 Agent 不仅"知道", 还要真的拿这个标识符去调工具 ——
+# 只凭记忆回答订单状态是不合格的 (记忆可能是旧的, 状态必须实时查)。
+#
+# 用法 (同一个运行时进程内跑对照):
+#   uv run python -m evals.runner --dataset evals/memory.jsonl --no-judge \
+#       --out evals/results/memory_off.json
+#   uv run python -m evals.runner --dataset evals/memory.jsonl --memory \
+#       --out evals/results/memory_on.json
+{"id": "mem_last_order", "sessions": [{"turns": ["帮我查一下订单 SO20260901001 的状态"]}, {"turns": ["上次那个订单现在怎么样了?"]}], "expect": {"tools_required": ["get_order_by_id"], "tool_args_contain": ["SO20260901001"], "answer_contains": [["已支付", "已付款", "PAID", "待发货"], ["机械键盘", "键盘"]]}, "rubric": "第二个会话里用户没有给订单号, 只用'上次那个订单'指代。助手应当从长期记忆里拿到 SO20260901001, 重新调用工具查询实时状态后回答; 不能反问订单号, 也不能只凭记忆复述旧状态。"}
+{"id": "mem_user_id", "sessions": [{"turns": ["我是用户 U1001, 帮我看看我名下有哪些订单"]}, {"turns": ["我的订单现在都什么状态?"]}], "expect": {"tools_required": ["list_orders_by_user"], "tool_args_contain": ["U1001"], "answer_contains": [["SO20260901001"]]}, "rubric": "第二个会话里用户没有重复自己的用户ID。助手应当从长期记忆里知道用户是 U1001, 用这个ID调用列表工具拿实时状态; 不能反问用户ID。"}
+{"id": "mem_most_recent_order", "sessions": [{"turns": ["帮我查一下订单 SO20260901001 的状态", "再看一下订单 SO20260901002"]}, {"turns": ["上次那个订单现在怎么样了?"]}], "expect": {"tools_required": ["get_order_by_id"], "tool_args_contain": ["SO20260901002"], "tool_args_not_contain": ["SO20260901001"], "answer_contains": [["已发货", "SHIPPED"]]}, "rubric": "第一个会话里先后提到两个订单, 最后提到的是 SO20260901002。'上次那个订单'应指最近提到的那个; 用 SO20260901001 回答说明记忆排序错了。"}

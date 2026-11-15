@@ -98,6 +98,23 @@ class Settings(BaseSettings):
     # 真压测时再调; 配成 0 会让池永远拿不到连接, 这里在装配时兜了一层。
     postgres_pool_max_size: int = 4
 
+    # ---------- 长期记忆 (跨会话) ----------
+    # 和上面的 checkpoint 不是一回事: checkpoint 记"同一个会话线程里的
+    # 上下文", 长期记忆记"这个用户跨会话仍然值得记住的事实"(订单号、用户ID、
+    # 答复偏好), 存在 Postgres 的 agent_memory 表里, 按 (租户, 操作者) 隔离。
+    #
+    # 依赖 postgres 后端: 没有连接池 (checkpoint=memory) 时本功能自动不启用 ——
+    # 要么都有持久化, 要么都没有, 不做半持久化状态。见 app/memory.py 头部。
+    #
+    # 默认开启, 因为它是"能力"而不是"实验"; 请求里的 use_memory 可以按次
+    # 关掉 (评测就是靠它在同一个进程里跑有/无记忆的对照, 不必重启服务)。
+    long_term_memory: bool = True
+    # 注入给模型的最大记忆条数。偏好类另有 2 条的独立上限 (见 select_memories)。
+    memory_top_k: int = 5
+    # 记忆的"新鲜度"窗口: 超过这么多天没被再次提到的记忆不再注入。
+    # 90 天是个经验值 —— 订单寿命通常以周计, 偏好可以更久。
+    memory_ttl_days: int = 90
+
     # ---------- PostgreSQL ----------
     postgres_host: str = "localhost"
     postgres_port: int = 5432

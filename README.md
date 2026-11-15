@@ -161,6 +161,8 @@ curl -H 'X-KM-Api-Key: dev-user-key-change-me' \
   反思闭环的设计取舍，以及缺陷注入实验的量化结果
 - [`docs/agent-security.md`](docs/agent-security.md) — 间接提示注入的威胁模型、
   两层防护设计，以及攻击成功率 33% → 0% 的量化
+- [`docs/agent-memory.md`](docs/agent-memory.md) — 跨会话长期记忆：只从用户
+  消息抽取事实、按 (租户, 操作者) 隔离、线索检索，以及多会话用例 0/3 → 3/3 的量化
 
 ---
 
@@ -248,7 +250,8 @@ K_middleware/
 │   ├── app/checkpoint.py         会话记忆后端（memory / postgres）
 │   ├── app/reflection.py         ★ 反思闭环：critic → 带反馈重答
 │   ├── app/safety.py             ★ 间接提示注入防护：策略 + spotlighting
-│   ├── evals/                    ★ 轨迹评估：金标准集 / 断言 + judge / 缺陷注入 / 注入集
+│   ├── app/memory.py             ★ 跨会话长期记忆：用户事实抽取 + 线索检索
+│   ├── evals/                    ★ 轨迹评估：金标准集 / 断言 + judge / 缺陷注入 / 注入集 / 记忆集
 │   └── tests/                    ★ 含 MCP 握手、任务链路、审计、断点续跑测试
 ├── docs/                         设计文档（状态机 / 审计 / 评测 / 安全）
 └── docker/migrations/            增量迁移（老 volume 不会重跑 init 里的建表）
@@ -276,6 +279,8 @@ K_middleware/
 - [x] 会话记忆（`session:<tenant>:<session_id>`）+ Postgres 断点续跑
 - [ ] RocketMQ **异步任务派发** —— 架构图上的那一块，现在派发仍是 HTTP，MQ 只用于审计汇聚
 - [ ] 基础 RAG 语义记忆 —— pgvector 容器已就绪，尚未接入
+  （跨会话"用户事实"记忆已单独实现，见 Phase 2；它不走 embedding，
+  解决的是"记得用户说过什么"，不是"检索知识库"）
 
 ### Phase 2 — 企业特性
 
@@ -304,6 +309,14 @@ K_middleware/
     （只改模型视图，审计/checkpoint 保留原文）
   - 量化：6 条注入用例，ASR **33% → 0%**（`off` → `prompt` / `spotlight`）
   - 详见 [`docs/agent-security.md`](docs/agent-security.md)
+- [x] 跨会话长期记忆 ← ✅ 2026-11-15
+  - 只从**用户消息**抽取持久事实（订单号 / 用户ID / 偏好），按 (租户, 操作者)
+    隔离；工具返回和订单备注永不入记忆 —— 否则一次间接注入会跨会话留存
+  - 线索检索（明确订单号 / "上次那个" / "我的" / 偏好），不做 embedding：
+    本机没有可用模型，且这里的检索信号本来就是结构化的
+  - 多会话用例 **0/3 → 3/3**（无记忆时反问订单号/用户ID）；16 条金标准
+    开记忆仍 16/16，代价 +20.8% 输入 token
+  - 详见 [`docs/agent-memory.md`](docs/agent-memory.md)
 - [ ] SSE 流式输出
 
 ### Phase 3 — 高阶亮点（可选）

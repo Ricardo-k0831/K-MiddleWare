@@ -1,0 +1,190 @@
+{
+  "generatedAt": "2026-11-15T07:13:05.608182+00:00",
+  "config": {
+    "dataset": "memory.jsonl",
+    "model": "deepseek-chat",
+    "reflect": false,
+    "maxReflections": 1,
+    "memory": true,
+    "judge": true
+  },
+  "summary": {
+    "cases": 3,
+    "passed": 3,
+    "passRate": 1.0,
+    "judgeAvgScore": 93.0,
+    "judgeErrors": 0,
+    "infrastructureErrors": 0,
+    "degradedCalls": 0,
+    "errors": 0,
+    "avgToolCalls": 1.0,
+    "reflectionRounds": 0,
+    "reflectionRetries": 0,
+    "tokenIn": 6794,
+    "tokenOut": 403
+  },
+  "compare": {
+    "passRateDelta": 1.0,
+    "judgeScoreDelta": 33.7,
+    "basePassRate": 0.0
+  },
+  "cases": [
+    {
+      "caseId": "mem_last_order",
+      "question": "上次那个订单现在怎么样了?",
+      "answer": "订单 SO20260901001 目前状态是**已支付（PAID）**，尚未发货。\n\n- 商品：机械键盘 87 键\n- 金额：499.00 元\n- 下单时间：2026-11-13 14:40\n\n需要我帮你查其他订单吗？",
+      "passed": true,
+      "deterministicOk": true,
+      "checks": [
+        {
+          "name": "答复包含 ['已支付', '已付款', 'PAID', '待发货']中的相关关键词",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "答复包含 ['机械键盘', '键盘']中的相关关键词",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "调用了 get_order_by_id",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "工具入参包含 'SO20260901001'",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "judge": {
+        "passed": true,
+        "score": 92,
+        "reason": "助手从记忆中取到订单号 SO20260901001 并重新调用工具查询，答复中的订单号、商品、金额、状态 PAID、下单时间均与工具返回一致，且切题回答了用户询问的订单现状。",
+        "error": ""
+      },
+      "stats": {
+        "rows": 11,
+        "llmCalls": 3,
+        "runtimeToolCalls": 1,
+        "gatewayToolCalls": 1,
+        "legacyCalls": 1,
+        "degraded": 0,
+        "errors": 0,
+        "tokenIn": 2243,
+        "tokenOut": 117
+      },
+      "tools": [
+        "get_order_by_id"
+      ],
+      "reflections": [],
+      "memoryUsed": 1,
+      "memoryWritten": 0,
+      "latencyMs": 10417,
+      "error": ""
+    },
+    {
+      "caseId": "mem_user_id",
+      "question": "我的订单现在都什么状态?",
+      "answer": "您名下共有 2 笔订单：\n\n| 订单号 | 商品 | 金额 | 状态 | 下单时间 |\n|---|---|---|---|---|\n| SO20260901001 | 机械键盘 87 键 | ¥499.00 | 已付款（PAID） | 2026-11-13 |\n| SO20260901002 | 人体工学椅 | ¥1,899.00 | 已发货（SHIPPED） | 2026-11-10 |\n\n需要查看某一笔的详情，告诉我订单号即可。",
+      "passed": true,
+      "deterministicOk": true,
+      "checks": [
+        {
+          "name": "答复包含 ['SO20260901001']中的相关关键词",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "调用了 list_orders_by_user",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "工具入参包含 'U1001'",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "judge": {
+        "passed": true,
+        "score": 95,
+        "reason": "答复中的两笔订单号、商品、金额、状态、下单时间均与 list_orders_by_user 返回数据完全一致，且直接回答了用户询问的订单状态问题。",
+        "error": ""
+      },
+      "stats": {
+        "rows": 11,
+        "llmCalls": 3,
+        "runtimeToolCalls": 1,
+        "gatewayToolCalls": 1,
+        "legacyCalls": 1,
+        "degraded": 0,
+        "errors": 0,
+        "tokenIn": 2309,
+        "tokenOut": 163
+      },
+      "tools": [
+        "list_orders_by_user"
+      ],
+      "reflections": [],
+      "memoryUsed": 1,
+      "memoryWritten": 0,
+      "latencyMs": 10769,
+      "error": ""
+    },
+    {
+      "caseId": "mem_most_recent_order",
+      "question": "上次那个订单现在怎么样了?",
+      "answer": "订单 SO20260901002 目前状态是**已发货（SHIPPED）**。\n\n- 商品：人体工学椅\n- 金额：1899.00 元\n- 下单时间：2026-11-10 14:40\n\n备注为空，没有其他异常信息。需要我帮你查物流或别的订单吗？",
+      "passed": true,
+      "deterministicOk": true,
+      "checks": [
+        {
+          "name": "答复包含 ['已发货', 'SHIPPED']中的相关关键词",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "调用了 get_order_by_id",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "工具入参包含 'SO20260901002'",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "name": "工具入参不包含 'SO20260901001'",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "judge": {
+        "passed": true,
+        "score": 92,
+        "reason": "答复中的订单号、商品、金额、状态、下单时间均与 get_order_by_id 返回一致，且正确指向最近提到的 SO20260901002，切题且无编造。",
+        "error": ""
+      },
+      "stats": {
+        "rows": 11,
+        "llmCalls": 3,
+        "runtimeToolCalls": 1,
+        "gatewayToolCalls": 1,
+        "legacyCalls": 1,
+        "degraded": 0,
+        "errors": 0,
+        "tokenIn": 2242,
+        "tokenOut": 123
+      },
+      "tools": [
+        "get_order_by_id"
+      ],
+      "reflections": [],
+      "memoryUsed": 1,
+      "memoryWritten": 0,
+      "latencyMs": 15994,
+      "error": ""
+    }
+  ]
+}

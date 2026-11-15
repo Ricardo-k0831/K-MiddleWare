@@ -17,6 +17,7 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -24,7 +25,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from app.audit import AuditCallbackHandler, AuditReporter
-from app.control_auth import control_auth_headers
 from app.checkpoint import (
     BACKEND_POSTGRES,
     MODE_BUSY,
@@ -38,10 +38,17 @@ from app.checkpoint import (
     resolve_thread_id,
 )
 from app.config import get_settings
+from app.control_auth import control_auth_headers
 from app.graph.agent import build_agent, build_llm
-from app.reflection import reflect_loop
 from app.heartbeat import HeartbeatBeater, LivenessRegistry
 from app.mcp_adapter import TaskIdentity, ToolProvider, build_tool_provider, task_identity
+from app.memory import (
+    PostgresMemoryStore,
+    extract_memories,
+    injected_contents,
+    load_memory_context,
+)
+from app.reflection import reflect_loop
 from app.task_state import (
     CANCELLED,
     COMPLETED,
@@ -95,6 +102,9 @@ class AppState:
     # checkpointer 及其连接池。收尾时必须显式关闭 —— 漏了不会报错,
     # 只会让进程退出时挂住, 或者 Postgres 那边堆一堆 idle 连接。
     checkpoints: CheckpointResources | None = None
+    # 跨会话长期记忆。None = 本进程不启用 (没配 postgres / 配置关掉 /
+    # 建表失败)。和 checkpointer 共用连接池, 所以收尾不需要单独关闭。
+    memories: PostgresMemoryStore | None = None
 
 
 state = AppState()
@@ -226,6 +236,38 @@ async def lifespan(app: FastAPI):
             state.checkpoints = None
             logger.exception("Agent 装配失败, 服务以降级模式启动")
 
+        # 长期记忆必须挂在 Postgres 上。checkpoint=memory 时没有连接池,
+        # 这里就不启用 —— 否则会出现"对话历史重启即丢, 但记忆还在"的半持久化
+        # 状态, 排查时很难解释。建表失败同样只降级本功能, 不影响 Agent。
+        if (
+            settings.long_term_memory
+            and state.checkpoints is not None
+            and state.checkpoints.backend == BACKEND_POSTGRES
+            and state.checkpoints.pool is not None
+        ):
+            try:
+                memories = PostgresMemoryStore(
+                    state.checkpoints.pool,
+                    ttl_days=settings.memory_ttl_days,
+                )
+                await memories.ensure_schema()
+                state.memories = memories
+                logger.info(
+                    "长期记忆已启用: 按 (租户, 操作者) 隔离, TTL %d 天",
+                    settings.memory_ttl_days,
+                )
+            except Exception:
+                # 和审计/心跳同一条原则: 旁路坏了不能把可用性搞坏。
+                logger.exception("长期记忆建表失败, 本进程不启用长期记忆")
+                state.memories = None
+        elif settings.long_term_memory:
+            # 默认后端是 memory, 所以这条在开发环境很常见 —— 说清楚"为什么
+            # 没启用", 而不是让人对着一个静默不工作的功能猜。
+            logger.info(
+                "长期记忆未启用: 需要 CHECKPOINT_BACKEND=postgres (当前 %s)",
+                state.checkpoints.backend if state.checkpoints is not None else "未装配",
+            )
+
         if (
             state.checkpoints is not None
             and state.checkpoints.backend == BACKEND_POSTGRES
@@ -246,6 +288,9 @@ async def lifespan(app: FastAPI):
     if state.checkpoints is not None:
         await state.checkpoints.aclose()
         state.checkpoints = None
+    # 连接池已经关了, 记忆对象不能再留着 —— 留一个用不了的 store 只会让
+    # 关闭后的 /chat 拿到 PoolClosed 异常, 而它本该是一个干净的 503。
+    state.memories = None
     logger.info("Agent 运行时已关闭")
 
 
@@ -320,6 +365,24 @@ class ChatRequest(BaseModel):
         ),
     )
 
+    # ---- 长期记忆 (跨会话) ----
+    #
+    # 一次请求同时控制"读"和"写": True 时先检索历史记忆注入上下文, 回答后
+    # 再把本轮用户消息里的持久事实抽出来落库; False 时两边都不做。
+    #
+    # ★ 为什么做成按请求开关, 而不是只放配置 ★
+    #
+    # 评测要在同一个进程里跑"有记忆 / 无记忆"的对照。重启服务换配置也能做,
+    # 但一个进程里跑完两遍, 两次运行的模型、工具、网关状态完全一致, 差异
+    # 才能归因到记忆本身。生产默认由 settings.long_term_memory 决定。
+    use_memory: bool | None = Field(
+        default=None,
+        description=(
+            "是否启用跨会话长期记忆 (读 + 写)。不传 = 跟随服务配置 "
+            "LONG_TERM_MEMORY; 传 false 可以按请求关掉。"
+        ),
+    )
+
     # ---- 反思闭环 (默认关闭) ----
     #
     # 打开后: 回答完先让质检员 (app/reflection.py) 判一次; 不合格就带着
@@ -362,6 +425,11 @@ class ChatResponse(BaseModel):
     # 没开 reflect 时是空数组 —— "没做"和"做了但全过"必须分得开, 否则
     # 评测分不清"反思有效"和"反思根本没跑"。
     reflections: list[dict[str, Any]] = Field(default_factory=list)
+    # 本轮注入了几条长期记忆 / 新写了几条。两个数分开报, 是为了让评测能区分
+    # "记忆写进去了但没被检索到"和"根本没写" —— 只报一个总数会把这两种
+    # 完全不同的失败混成一个数字。
+    memory_used: int = 0
+    memory_written: int = 0
 
 
 class CancelRequest(BaseModel):
@@ -414,6 +482,9 @@ async def health() -> dict[str, Any]:
         "checkpoint_degraded": (
             state.checkpoints.degraded_reason if state.checkpoints is not None else None
         ),
+        # 长期记忆启没启用同样要能从外面看见: "为什么它不记得上次的订单"
+        # 第一个要确认的就是这里, 而不是去翻请求日志。
+        "long_term_memory": state.memories is not None,
     }
 
 # 该接口返回的工具是ToolSpec列表, 不是 LangChain的 BaseTool 列表
@@ -631,6 +702,21 @@ async def chat(req: ChatRequest) -> ChatResponse:
     session_id = (req.session_id or "").strip() or None
     tenant_id = (req.tenant_id or "").strip() or None
 
+    # ---- 长期记忆的开关与分区键 ----
+    #
+    # 没有 actor 就没有隔离边界: 此时不读也不写, 而不是退化成全局共享表。
+    # 租户缺省用 "-" (和 resolve_thread_id 的兜底一致), 不补一个假租户名。
+    store = state.memories
+    memory_enabled = bool(
+        (settings.long_term_memory if req.use_memory is None else req.use_memory)
+        and store is not None
+        and (req.actor or "").strip()
+    )
+    memory_actor = (req.actor or "").strip() or None
+    memory_tenant = tenant_id or "-"
+    memory_used = 0
+    memory_written = 0
+
     reporter: TaskStateReporter | None = None
     audit: AuditReporter | None = None
     beater: HeartbeatBeater | None = None
@@ -817,6 +903,44 @@ async def chat(req: ChatRequest) -> ChatResponse:
                             plan.mode,
                             plan.pending_nodes or "-",
                         )
+
+                    # ★ 跨会话长期记忆: 只在 FRESH 时注入 ★
+                    #
+                    # RESUME / REPLAY 没有新的用户消息, 这个问题的指代在上一次
+                    # invocation 里就已经解决过了; 再注入一条记忆只会改变重试/
+                    # 复述的行为 —— 而这两条路径要的恰恰是"和上次一模一样"。
+                    #
+                    # 注入方式是往本轮输入前面加一条 SystemMessage, 它会随图
+                    # 写进 checkpoint: 同一会话后续轮次仍然看得到; 跨会话的
+                    # 下一轮会重新检索、重新注入 (所以记忆更新后不会一直用旧的)。
+                    if memory_enabled and plan.mode == MODE_FRESH and plan.payload is not None:
+                        note, chosen = await load_memory_context(
+                            store,
+                            tenant_id=memory_tenant,
+                            actor_id=memory_actor,
+                            query=req.message,
+                            top_k=settings.memory_top_k,
+                            # 同一会话里已经注入过的同一条记忆不再重复注入:
+                            # 否则每一轮 FRESH 都会再叠一条 SystemMessage。
+                            exclude_contents=injected_contents(plan.prior_messages),
+                        )
+                        if note is not None:
+                            plan = replace(
+                                plan,
+                                payload={
+                                    **plan.payload,
+                                    "messages": [note, *plan.payload.get("messages", [])],
+                                },
+                            )
+                            memory_used = len(chosen)
+                            # 使用计数是维护数据 (决定哪些记忆不被 TTL 清掉),
+                            # 失败由 store 自己吞掉, 不影响这一轮。
+                            await store.mark_used(
+                                tenant_id=memory_tenant,
+                                actor_id=memory_actor,
+                                contents=[item.content for item in chosen],
+                            )
+
                     result = await _run_agent(
                         state.agent,
                         plan.payload,
@@ -892,6 +1016,43 @@ async def chat(req: ChatRequest) -> ChatResponse:
                     if name:
                         tool_calls.append(name)
 
+            # ★ 长期记忆的写入 ★
+            #
+            # 输入只有【本轮新增的用户消息】(user_turns 里再过滤掉反思反馈)。
+            # 工具返回、助手答复、备注一律不进 —— 理由见 app/memory.py 头部:
+            # 备注是间接提示注入的入口, 一旦写进长期记忆, 一次注入就会跨会话
+            # 留存。抽取失败 (网络/JSON) 只丢一条 WARNING, 不能把成功的对话
+            # 变成 500: 记忆是增益, 不是依赖。
+            #
+            # REPLAY 整条跳过: 图一个节点都没跑, new_messages 里不会有用户
+            # 消息; 真去抽也只会抽到空的, 还会多花一次 LLM 调用。
+            if (
+                memory_enabled
+                and plan.mode != MODE_REPLAY
+                and state.critic is not None
+                and new_messages
+            ):
+                facts = await extract_memories(state.critic, new_messages, config=config)
+                if facts:
+                    try:
+                        memory_written = await store.add(
+                            tenant_id=memory_tenant,
+                            actor_id=memory_actor,
+                            facts=facts,
+                            source_task_id=task_id,
+                            source_session=session_id,
+                        )
+                    except Exception:
+                        logger.warning("长期记忆写入失败, 本轮回答不受影响", exc_info=True)
+                        memory_written = 0
+                    if memory_written:
+                        logger.info(
+                            "长期记忆写入 %d 条 (tenant=%s actor=%s)",
+                            memory_written,
+                            memory_tenant,
+                            memory_actor,
+                        )
+
             # ★ 终态由这里报, 不由 CallbackHandler 报 ★
             # 只有这里知道这轮 invocation 到底成没成。工具报错【不】代表任务失败 ——
             # ReAct 循环存在的意义就是从工具错误里恢复。详见 app/task_state.py
@@ -938,6 +1099,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
         task_id=task_id,
         trace_id=identity.trace_id if identity is not None else None,
         reflections=reflections,
+        memory_used=memory_used,
+        memory_written=memory_written,
     )
 
 

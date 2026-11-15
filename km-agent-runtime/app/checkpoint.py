@@ -271,6 +271,14 @@ class InvocationPlan:
     # 回给调用方是为了让 409 的报错能说清"被谁挡住了"。
     busy_task_id: str | None = None
 
+    # 调用前这个 thread 里已有的消息。
+    #
+    # 给长期记忆注入做去重用: 同一条记忆在同一个会话里只该出现一次。
+    # 不返回它的话, 每一轮 FRESH 都会再注入一条 SystemMessage —— 长会话里
+    # 同一条"用户查询过订单 X"会叠很多份, 上下文越滚越大。
+    # 默认空元组: 新线程/读不到快照时没有历史。
+    prior_messages: tuple[Any, ...] = ()
+
     @property
     def resumes(self) -> bool:
         return self.payload is None
@@ -368,7 +376,7 @@ async def plan_invocation(
                 pending_nodes=pending,
             )
         # 用户发起了新的问题. 和挂起前最新的用户消息有所不同
-        return _fresh(message, baseline)
+        return _fresh(message, baseline, tuple(messages))
 
     # 同一个任务重试, 而图上一次已经跑出了答复 —— 别再问一遍 LLM。
     # ★ 必须核对归属 ★ 会话线程里"最后一条是 AI"可能是上一个任务的答案,
@@ -381,7 +389,7 @@ async def plan_invocation(
             baseline_messages=baseline,
         )
 
-    return _fresh(message, baseline)
+    return _fresh(message, baseline, tuple(messages))
 
 
 # 取消任务时写进图里的那条消息。它是"收尾", 不是"回答" —— 措辞要让
@@ -527,11 +535,16 @@ async def _read_snapshot(agent: Any, config: dict[str, Any]) -> tuple[Any, str |
         return None, f"{type(ex).__name__}: {ex}"
 
 # 追加新消息, 组装新一轮对话的InvocationPlan对象
-def _fresh(message: str, baseline_messages: int = 0) -> InvocationPlan:
+def _fresh(
+    message: str,
+    baseline_messages: int = 0,
+    prior_messages: tuple[Any, ...] = (),
+) -> InvocationPlan:
     return InvocationPlan(
         payload={"messages": [{"role": "user", "content": message}]},
         mode=MODE_FRESH,
         baseline_messages=baseline_messages,
+        prior_messages=prior_messages,
     )
 
 # 从快照中提取消息列表

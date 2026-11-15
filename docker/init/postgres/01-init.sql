@@ -67,3 +67,35 @@ CREATE INDEX IF NOT EXISTS idx_episode_memory_lookup
 -- 关键点: checkpoint 只用于"Agent 思考流程"的断点恢复,
 --         任务的生命周期状态仍然由 Java 侧 MySQL 说了算。
 -- ------------------------------------------------------------
+
+-- ------------------------------------------------------------
+-- 跨会话长期记忆: 用户事实 (订单号 / 用户ID / 答复偏好)
+--
+-- 和上面两张表的区别: 这里存的是"关于这个用户、跨会话仍然成立的事实",
+-- 由 app/memory.py 在每轮回答后抽取, 按 (租户, 操作者) 隔离。
+-- 新数据卷会在这里建好; 已经跑起来的库由服务启动时的
+-- CREATE TABLE IF NOT EXISTS 兜底, 或手工执行
+-- docker/migrations/2026-11-15-agent-memory.sql。
+-- DDL 以 app/memory.py 的 ensure_schema 为准, 三处保持一致。
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_memory (
+    id             BIGSERIAL PRIMARY KEY,
+    tenant_id      VARCHAR(64)  NOT NULL,
+    actor_id       VARCHAR(128) NOT NULL,
+    kind           VARCHAR(32)  NOT NULL,
+    content        TEXT         NOT NULL,
+    order_id       VARCHAR(64),
+    keywords       TEXT         NOT NULL DEFAULT '',
+    content_hash   CHAR(64)     NOT NULL,
+    source_task_id VARCHAR(64),
+    source_session VARCHAR(128),
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    last_seen_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    use_count      INTEGER      NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_memory_scope_hash
+    ON agent_memory (tenant_id, actor_id, content_hash);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_scope_recent
+    ON agent_memory (tenant_id, actor_id, last_seen_at DESC);
