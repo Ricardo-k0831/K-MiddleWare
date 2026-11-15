@@ -24,6 +24,12 @@ from langgraph.prebuilt import create_react_agent
 
 from app.config import Settings
 from app.mcp_adapter.base import ToolProvider
+from app.safety import (
+    needs_spotlight,
+    resolve_defense,
+    spotlight_hook,
+    system_prompt_suffix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +127,16 @@ async def build_agent(
     if checkpointer is None:
         checkpointer = InMemorySaver()
 
+    # 提示注入防护: 提示词策略与 tool-output 边界都按同一个配置级别开关。
+    # 为什么用 pre_model_hook 而不是改工具实现: 它只替换"喂给模型的消息视图",
+    # graph state / checkpoint / 审计里仍是工具原文 —— 细节见 app/safety.py。
+    defense = resolve_defense(settings.injection_defense)
+    logger.info("提示注入防护级别: %s", defense)
     return create_react_agent(
         build_llm(settings),
         list(tools),
-        prompt=resolve_system_prompt(settings.agent_prompt_variant),
+        prompt=resolve_system_prompt(settings.agent_prompt_variant)
+        + system_prompt_suffix(defense),
         checkpointer=checkpointer,
+        pre_model_hook=spotlight_hook if needs_spotlight(defense) else None,
     )

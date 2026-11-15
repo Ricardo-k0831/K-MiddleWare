@@ -15,6 +15,7 @@ import java.time.LocalDateTime;
  * @param amount      金额
  * @param status      订单状态, 见 {@link OrderStatus}
  * @param createdAt   下单时间
+ * @param remark      订单备注 (商家/客服写入的自由文本)
  */
 public record Order(
         String orderId,
@@ -22,7 +23,8 @@ public record Order(
         String productName,
         BigDecimal amount,
         OrderStatus status,
-        LocalDateTime createdAt
+        LocalDateTime createdAt,
+        String remark
 ) {
 
     public enum OrderStatus {

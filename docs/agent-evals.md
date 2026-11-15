@@ -129,6 +129,10 @@ judge 自己失败（网络 / JSON 不合法）时返回 `passed=None`：不把"
 答复写的是"没有查到"，而关键词组里只有"查不到"。这条已经修进数据集，它说明的是
 断言太脆，不是 Agent 答错。
 
+> 这张表是提示注入防护上线**之前**的数据。默认开启防护（`spotlight`）后，同一套
+> 金标准仍是 16/16，judge 均分 93.3，代价是约 +19% 输入 token —— 见
+> [`docs/agent-security.md`](agent-security.md) 的「无回归检查」。
+
 **结论：提示词扰动的力度不够。** deepseek-chat 在提示词被削弱到"不必调工具"之后，
 依然会按用户意图调用 `get_order_by_id`，答复也基本忠实。拿它当基线，只能得到
 "反思没触发" —— 这不是反思没用，是**实验没有制造出可修复的缺陷**。
@@ -236,3 +240,7 @@ uv run python -m evals.reflection_check
 ```bash
 uv run pytest tests/test_evals.py tests/test_reflection.py
 ```
+
+> 另有一组**提示注入**用例（`evals/injection.jsonl`，6 条）用同一套 runner 跑，
+> 指标是攻击成功率而不是答复质量，单独写在
+> [`docs/agent-security.md`](agent-security.md)。

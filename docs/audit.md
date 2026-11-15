@@ -809,7 +809,7 @@ cd km-control-plane && mvn install
 #                      TrajectoryControllerTest             3   (字段契约 + 跨租户 404)  ← 2026-11-12
 
 cd km-agent-runtime && uv run pytest
-# 211 passed   (服务全起时不再跳过 MCP 握手用例)
+# 218 passed   (服务全起时不再跳过 MCP 握手用例)
 ```
 
 > 这个数字维护在**一处**：上一节「单元测试」只写规模，不抄清单 —— 两处各写

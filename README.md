@@ -159,6 +159,8 @@ curl -H 'X-KM-Api-Key: dev-user-key-change-me' \
 - [`docs/audit.md`](docs/audit.md) — 四层审计的数据模型、投递链路、身份核对与已知边界
 - [`docs/agent-evals.md`](docs/agent-evals.md) — 轨迹评估（金标准集 / 断言 + judge）、
   反思闭环的设计取舍，以及缺陷注入实验的量化结果
+- [`docs/agent-security.md`](docs/agent-security.md) — 间接提示注入的威胁模型、
+  两层防护设计，以及攻击成功率 33% → 0% 的量化
 
 ---
 
@@ -245,9 +247,10 @@ K_middleware/
 │   ├── app/graph/                LangGraph 编排
 │   ├── app/checkpoint.py         会话记忆后端（memory / postgres）
 │   ├── app/reflection.py         ★ 反思闭环：critic → 带反馈重答
-│   ├── evals/                    ★ 轨迹评估：金标准集 / 断言 + judge / 缺陷注入
+│   ├── app/safety.py             ★ 间接提示注入防护：策略 + spotlighting
+│   ├── evals/                    ★ 轨迹评估：金标准集 / 断言 + judge / 缺陷注入 / 注入集
 │   └── tests/                    ★ 含 MCP 握手、任务链路、审计、断点续跑测试
-├── docs/                         设计文档（状态机 / 审计 / 评测）
+├── docs/                         设计文档（状态机 / 审计 / 评测 / 安全）
 └── docker/migrations/            增量迁移（老 volume 不会重跑 init 里的建表）
 ```
 
@@ -294,7 +297,13 @@ K_middleware/
   - 缺陷注入：干净答复 0 误报，编造事实 16/16 检出、16/16 修复
   - 方法见 [`docs/agent-evals.md`](docs/agent-evals.md)
 - [ ] 全链路 OTel 追踪、Token 指标、Micrometer 指标与审计采样率策略
-- [ ] Prompt 注入防护
+- [x] 提示注入防护（直接 + 间接）← ✅ 2026-11-15
+  - 威胁模型：工具返回的订单备注可能带指令；显式指令多数模型能扛，**数据污染**
+    （备注与结构化字段冲突）才是真正的攻击面
+  - 两层防护：系统提示词安全边界 + `pre_model_hook` 对工具返回做 spotlighting
+    （只改模型视图，审计/checkpoint 保留原文）
+  - 量化：6 条注入用例，ASR **33% → 0%**（`off` → `prompt` / `spotlight`）
+  - 详见 [`docs/agent-security.md`](docs/agent-security.md)
 - [ ] SSE 流式输出
 
 ### Phase 3 — 高阶亮点（可选）

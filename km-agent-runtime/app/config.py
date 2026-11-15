@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     # 详见 docs/agent-evals.md 第五节。
     agent_prompt_variant: str = "default"
 
+    # ---------- 提示注入防护 ----------
+    # off       = 关闭 (只用于对照实验)
+    # prompt    = 只在系统提示词里加安全边界
+    # spotlight = 提示词 + 把每个工具返回框成"不可信数据" (生产默认)
+    #
+    # 为什么要分级: 单靠提示词对"数据污染"类注入(备注和结构化字段冲突)往往不够,
+    # 但"提示词 vs spotlight"分开跑才能看出第二层到底多赚了多少 —— 指标见
+    # docs/agent-evals.md 第七节。实现见 app/safety.py。
+    injection_defense: str = "spotlight"
+
     # ---------- MCP ----------
     mcp_order_server_url: str = "http://localhost:8081/mcp"
     mcp_auth_token: str = "dev-token"
